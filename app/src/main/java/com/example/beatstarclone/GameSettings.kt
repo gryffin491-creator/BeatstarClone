@@ -5,7 +5,8 @@ data class GameSettings(
     val hitWindowPerfect: Float = 80f,
     val hitWindowGood: Float = 160f,
     val hitWindowOK: Float = 250f,
-    val volume: Float = 1.0f
+    val volume: Float = 1.0f,
+    val audioOffsetMs: Long = 0L
 ) {
     companion object {
         val DEFAULT = GameSettings()
