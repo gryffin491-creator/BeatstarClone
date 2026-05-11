@@ -11,10 +11,12 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.graphics.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 // 1. DATA CLASSES
@@ -89,9 +91,16 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     @Volatile
     private var gameState = GameState.MAIN_MENU
     @Volatile
-    private var consecutiveMisses = 0
-    @Volatile
     private var beatsReady = false
+
+    // Score multiplier and health bar
+    private val scoreMultiplier = ScoreMultiplier()
+    private val healthBar = HealthBar()
+
+    // Swipe tracking per pointer
+    private val touchDownX = HashMap<Int, Float>()
+    private val touchDownY = HashMap<Int, Float>()
+    private val touchDownTime = HashMap<Int, Long>()
 
     // Game Logic Variables
     private val tiles = CopyOnWriteArrayList<Tile>()
@@ -126,6 +135,8 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     // Combo animation
     private var comboAnimStartTime = 0L
     private var borderFlashTime = 0L
+    private var multiplierAnimStartTime = 0L
+    private var lastMultiplierLevel = 1
 
     // Screen Transition
     private var currentTransition: ScreenTransition? = null
@@ -246,7 +257,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         val nextNote = songNotes[nextNoteIndex]
 
                         if (currentTime + currentSettings.audioOffsetMs >= nextNote.timestamp - activeSpawnAhead) {
-                            spawnTile(nextNote.lane)
+                            spawnTile(nextNote)
                             nextNoteIndex++
                         }
                     }
@@ -265,10 +276,11 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 if (!tile.isHit) {
                     synchronized(lock) {
                         score -= 10
-                        consecutiveMisses++
+                        scoreMultiplier.onMiss()
+                        healthBar.onMiss()
                         combo = 0
 
-                        if (consecutiveMisses >= 10) {
+                        if (healthBar.isDead()) {
                             gameState = GameState.GAME_OVER
                             safeMediaPause()
                             return
@@ -304,8 +316,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         particles.removeAll { particle -> particle.alpha <= 0f }
     }
 
-    private fun spawnTile(lane: Int) {
-        val newTile = Tile(lane = lane, y = height.toFloat() + 300f)
+    private fun spawnTile(note: Note) {
+        val activeTileSpeed = currentDifficulty?.tileSpeed ?: currentSettings.tileSpeed
+        val newTile = Tile(
+            lane = note.lane,
+            y = height.toFloat() + 300f,
+            noteType = note.noteType,
+            swipeDirection = note.swipeDirection
+        )
+        if (note.noteType == NoteType.HOLD) {
+            newTile.holdEndY = (note.holdDurationMs / 17f) * activeTileSpeed
+        }
         tiles.add(newTile)
     }
 
@@ -642,6 +663,184 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawRoundRect(tileRect, 40f, 40f, paint)
     }
 
+    private fun drawHoldTile(canvas: Canvas, tile: Tile, laneWidth: Float) {
+        val tileX = tile.lane * laneWidth
+        val padding = 20f
+        val ribbonPadding = 35f
+        val laneColor = getLaneColor(tile.lane)
+
+        // Draw the ribbon extending upward from tile
+        val ribbonRect = RectF(
+            tileX + ribbonPadding,
+            tile.y - tile.holdEndY,
+            tileX + laneWidth - ribbonPadding,
+            tile.y + 150f
+        )
+        paint.color = laneColor
+        paint.alpha = 120
+        paint.style = Paint.Style.FILL
+        canvas.drawRoundRect(ribbonRect, 20f, 20f, paint)
+
+        // Draw the main tile on top (pill shape)
+        val tileRect = RectF(
+            tileX + padding,
+            tile.y,
+            tileX + laneWidth - padding,
+            tile.y + 300f
+        )
+
+        // Glow layer
+        val glowRect = RectF(
+            tileRect.left - 8f,
+            tileRect.top - 8f,
+            tileRect.right + 8f,
+            tileRect.bottom + 8f
+        )
+        paint.color = laneColor
+        paint.alpha = 60
+        canvas.drawRoundRect(glowRect, 48f, 48f, paint)
+
+        // Main tile
+        paint.color = laneColor
+        paint.alpha = 255
+        canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+
+        // If being held, draw a brighter indicator
+        if (tile.isHeld) {
+            paint.color = Color.WHITE
+            paint.alpha = 80
+            canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+        }
+    }
+
+    private fun drawSwipeTile(canvas: Canvas, tile: Tile, laneWidth: Float) {
+        // Draw base tile first
+        drawTile(canvas, tile, laneWidth)
+
+        // Draw arrow/chevron on top
+        val tileX = tile.lane * laneWidth
+        val centerX = tileX + laneWidth / 2f
+        val centerY = tile.y + 150f
+        val arrowSize = 40f
+
+        paint.color = Color.WHITE
+        paint.alpha = 255
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 8f
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
+
+        val path = Path()
+        when (tile.swipeDirection) {
+            SwipeDirection.LEFT -> {
+                // Draw < shape
+                path.moveTo(centerX + arrowSize, centerY - arrowSize)
+                path.lineTo(centerX - arrowSize, centerY)
+                path.lineTo(centerX + arrowSize, centerY + arrowSize)
+            }
+            SwipeDirection.RIGHT -> {
+                // Draw > shape
+                path.moveTo(centerX - arrowSize, centerY - arrowSize)
+                path.lineTo(centerX + arrowSize, centerY)
+                path.lineTo(centerX - arrowSize, centerY + arrowSize)
+            }
+            SwipeDirection.UP -> {
+                // Draw ^ shape
+                path.moveTo(centerX - arrowSize, centerY + arrowSize)
+                path.lineTo(centerX, centerY - arrowSize)
+                path.lineTo(centerX + arrowSize, centerY + arrowSize)
+            }
+            null -> { /* no arrow */ }
+        }
+        canvas.drawPath(path, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.strokeWidth = 1f
+    }
+
+    private fun drawHealthBar(canvas: Canvas) {
+        val barLeft = 0f
+        val barRight = 20f
+        val barTop = 200f
+        val barBottom = height.toFloat() - 200f
+        val barHeight = barBottom - barTop
+
+        // Background
+        paint.color = Color.parseColor("#333333")
+        paint.style = Paint.Style.FILL
+        paint.alpha = 255
+        canvas.drawRect(barLeft, barTop, barRight, barBottom, paint)
+
+        // Health fill from bottom upward
+        val health = healthBar.getHealth()
+        val fillHeight = barHeight * health
+        val fillTop = barBottom - fillHeight
+
+        // Color: red (<0.3) -> yellow (<0.6) -> green (>=0.6)
+        val healthColor = when {
+            health < 0.3f -> {
+                val ratio = health / 0.3f
+                Color.rgb(255, (255 * ratio).toInt().coerceIn(0, 255), 0)
+            }
+            health < 0.6f -> {
+                val ratio = (health - 0.3f) / 0.3f
+                Color.rgb((255 * (1f - ratio)).toInt().coerceIn(0, 255), 255, 0)
+            }
+            else -> {
+                Color.rgb(0, 255, 0)
+            }
+        }
+
+        paint.color = healthColor
+
+        // Pulse effect when health < 0.25
+        if (health < 0.25f && health > 0f) {
+            val pulseAlpha = (200 + 55 * sin(System.currentTimeMillis() / 200.0).toFloat()).toInt().coerceIn(100, 255)
+            paint.alpha = pulseAlpha
+        } else {
+            paint.alpha = 255
+        }
+
+        canvas.drawRect(barLeft, fillTop, barRight, barBottom, paint)
+        paint.alpha = 255
+    }
+
+    private fun drawMultiplierDisplay(canvas: Canvas, currentTime: Long) {
+        val multiplier = scoreMultiplier.getMultiplier()
+        if (multiplier <= 1) return
+
+        val text = "x$multiplier"
+        val textX = 350f
+        val textY = 100f
+
+        // Scale animation when multiplier changes
+        val animElapsed = currentTime - multiplierAnimStartTime
+        val scale = if (animElapsed < 200) {
+            1.0f + 0.5f * (1f - animElapsed / 200f)
+        } else {
+            1.0f
+        }
+
+        // Color based on multiplier level
+        val color = when (multiplier) {
+            2 -> Color.parseColor("#00BCD4") // cyan
+            4 -> Color.parseColor("#FFD700") // gold
+            8 -> Color.parseColor("#FF6B00") // orange/fire
+            else -> Color.WHITE
+        }
+
+        canvas.save()
+        canvas.translate(textX, textY)
+        canvas.scale(scale, scale)
+        paint.color = color
+        paint.textSize = 60f
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        paint.alpha = 255
+        canvas.drawText(text, 0f, 0f, paint)
+        canvas.restore()
+    }
+
     private fun drawCountdown(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
 
@@ -726,7 +925,11 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         for (tile in tiles) {
             if (tile.isHit) continue
-            drawTile(canvas, tile, laneWidth)
+            when (tile.noteType) {
+                NoteType.TAP -> drawTile(canvas, tile, laneWidth)
+                NoteType.HOLD -> drawHoldTile(canvas, tile, laneWidth)
+                NoteType.SWIPE -> drawSwipeTile(canvas, tile, laneWidth)
+            }
         }
 
         // Draw hit-animating tiles (scale + fade)
@@ -832,6 +1035,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
         paint.alpha = 255
         paint.style = Paint.Style.FILL
+
+        // Draw Health Bar (vertical bar on left edge)
+        drawHealthBar(canvas)
+
+        // Draw Multiplier display
+        drawMultiplierDisplay(canvas, currentTime)
 
         // Draw Pause button (two vertical bars) in top-right corner
         paint.color = Color.WHITE
@@ -946,6 +1155,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 }
                 val pX = event.getX(pointerIndex)
                 val pY = event.getY(pointerIndex)
+                val pointerId = event.getPointerId(pointerIndex)
+
+                // Track touch down for swipe detection
+                if (gameState == GameState.PLAYING) {
+                    touchDownX[pointerId] = pX
+                    touchDownY[pointerId] = pY
+                    touchDownTime[pointerId] = System.currentTimeMillis()
+
+                    // Handle hold note start
+                    handleHoldDown(pX, pY)
+                }
 
                 when (gameState) {
                     GameState.MAIN_MENU -> handleMainMenuTouch(pX, pY)
@@ -970,6 +1190,45 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                 if (gameState == GameState.SETTINGS) {
                     draggingSlider = -1
+                }
+                if (gameState == GameState.PLAYING) {
+                    val pointerIndex = if (action == MotionEvent.ACTION_POINTER_UP) {
+                        event.actionIndex
+                    } else {
+                        0
+                    }
+                    val pointerId = event.getPointerId(pointerIndex)
+                    val upX = event.getX(pointerIndex)
+                    val upY = event.getY(pointerIndex)
+                    val upTime = System.currentTimeMillis()
+
+                    val downX = touchDownX[pointerId] ?: upX
+                    val downY = touchDownY[pointerId] ?: upY
+                    val downTime = touchDownTime[pointerId] ?: upTime
+
+                    // Check for hold note release
+                    handleHoldUp(upX, upY)
+
+                    // Check for swipe gesture
+                    val dx = upX - downX
+                    val dy = upY - downY
+                    val dt = upTime - downTime
+                    val displacement = sqrt(dx * dx + dy * dy)
+                    val velocity = if (dt > 0) displacement / (dt / 1000f) else 0f
+
+                    if (velocity > 800f && displacement > 80f) {
+                        val swipeDir = if (abs(dx) > abs(dy)) {
+                            if (dx < 0) SwipeDirection.LEFT else SwipeDirection.RIGHT
+                        } else {
+                            SwipeDirection.UP // dy < 0 means swipe up
+                        }
+                        handleSwipe(downX, swipeDir)
+                    }
+
+                    // Clean up tracking maps
+                    touchDownX.remove(pointerId)
+                    touchDownY.remove(pointerId)
+                    touchDownTime.remove(pointerId)
                 }
             }
         }
@@ -1099,7 +1358,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         val hitWindowMult = currentDifficulty?.hitWindowMultiplier ?: 1.0f
 
         for (tile in tiles) {
-            if (tile.lane == touchedLane && !tile.isHit) {
+            if (tile.lane == touchedLane && !tile.isHit && tile.noteType == NoteType.TAP) {
                 val tileCenter = tile.y + 150f
                 val distance = abs(tileCenter - perfectLineY)
 
@@ -1133,11 +1392,21 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         }
                     }
 
+                    val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
+
                     synchronized(lock) {
-                        score += scoreGain
-                        consecutiveMisses = 0
-                        combo++
+                        scoreMultiplier.onHit()
+                        healthBar.onHit()
+                        score += multipliedGain
+                        combo = scoreMultiplier.getCombo()
                         comboAnimStartTime = System.currentTimeMillis()
+
+                        val newMultiplier = scoreMultiplier.getMultiplier()
+                        if (newMultiplier != lastMultiplierLevel) {
+                            multiplierAnimStartTime = System.currentTimeMillis()
+                            lastMultiplierLevel = newMultiplier
+                        }
+
                         if (combo == 10 || combo == 25 || combo == 50 || combo == 100) {
                             borderFlashTime = System.currentTimeMillis()
                         }
@@ -1161,7 +1430,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     // Score popup near score area
                     if (hitFeedbacks.size < 50) {
                         hitFeedbacks.add(HitFeedback(
-                            text = "+$scoreGain",
+                            text = "+$multipliedGain",
                             x = 200f,
                             y = 130f,
                             alpha = 255f,
@@ -1199,6 +1468,201 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
     }
 
+    private fun handleSwipe(downX: Float, direction: SwipeDirection) {
+        val laneWidth = width / 3f
+        val touchedLane = (downX / laneWidth).toInt().coerceIn(0, 2)
+
+        for (tile in tiles) {
+            if (tile.lane == touchedLane && !tile.isHit && tile.noteType == NoteType.SWIPE) {
+                val tileCenter = tile.y + 150f
+                val distance = abs(tileCenter - perfectLineY)
+                val hitWindowMult = currentDifficulty?.hitWindowMultiplier ?: 1.0f
+                val effectiveOK = currentSettings.hitWindowOK * hitWindowMult
+
+                if (distance < effectiveOK) {
+                    if (tile.swipeDirection == direction) {
+                        // Correct swipe direction - score it
+                        tile.isHit = true
+                        tile.hitTime = System.currentTimeMillis()
+
+                        val effectivePerfect = currentSettings.hitWindowPerfect * hitWindowMult
+                        val effectiveGood = currentSettings.hitWindowGood * hitWindowMult
+
+                        val scoreGain: Int
+                        val feedbackText: String
+                        val feedbackColor: Int
+
+                        when {
+                            distance < effectivePerfect -> {
+                                scoreGain = 150
+                                feedbackText = "Perfect!"
+                                feedbackColor = Color.parseColor("#FF00BCD4")
+                            }
+                            distance < effectiveGood -> {
+                                scoreGain = 100
+                                feedbackText = "Good!"
+                                feedbackColor = Color.parseColor("#FF4CAF50")
+                            }
+                            else -> {
+                                scoreGain = 50
+                                feedbackText = "OK!"
+                                feedbackColor = Color.parseColor("#FFFFC107")
+                            }
+                        }
+
+                        val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
+
+                        synchronized(lock) {
+                            scoreMultiplier.onHit()
+                            healthBar.onHit()
+                            score += multipliedGain
+                            combo = scoreMultiplier.getCombo()
+                            comboAnimStartTime = System.currentTimeMillis()
+
+                            val newMultiplier = scoreMultiplier.getMultiplier()
+                            if (newMultiplier != lastMultiplierLevel) {
+                                multiplierAnimStartTime = System.currentTimeMillis()
+                                lastMultiplierLevel = newMultiplier
+                            }
+                        }
+
+                        val feedbackX = tile.lane * laneWidth + laneWidth / 2f
+                        val feedbackY = perfectLineY - 50f
+                        if (hitFeedbacks.size < 50) {
+                            hitFeedbacks.add(HitFeedback(feedbackText, feedbackX, feedbackY, 255f, System.currentTimeMillis(), feedbackColor))
+                        }
+                        if (hitFeedbacks.size < 50) {
+                            hitFeedbacks.add(HitFeedback("+$multipliedGain", 200f, 130f, 255f, System.currentTimeMillis(), Color.WHITE))
+                        }
+                        if (laneGlows.size < 20) {
+                            laneGlows.add(LaneGlow(tile.lane, System.currentTimeMillis(), feedbackColor))
+                        }
+                    } else {
+                        // Wrong swipe direction - miss
+                        synchronized(lock) {
+                            scoreMultiplier.onMiss()
+                            healthBar.onMiss()
+                            combo = 0
+                        }
+                        if (missFlashes.size < 10) {
+                            missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    private fun handleHoldDown(x: Float, y: Float) {
+        val laneWidth = width / 3f
+        val touchedLane = (x / laneWidth).toInt().coerceIn(0, 2)
+
+        for (tile in tiles) {
+            if (tile.lane == touchedLane && !tile.isHit && tile.noteType == NoteType.HOLD && !tile.isHeld) {
+                val tileCenter = tile.y + 150f
+                val distance = abs(tileCenter - perfectLineY)
+                val hitWindowMult = currentDifficulty?.hitWindowMultiplier ?: 1.0f
+                val effectiveOK = currentSettings.hitWindowOK * hitWindowMult
+
+                if (distance < effectiveOK) {
+                    tile.isHeld = true
+                    tile.hitTime = System.currentTimeMillis()
+                    break
+                }
+            }
+        }
+    }
+
+    private fun handleHoldUp(x: Float, y: Float) {
+        val laneWidth = width / 3f
+        val touchedLane = (x / laneWidth).toInt().coerceIn(0, 2)
+
+        for (tile in tiles) {
+            if (tile.lane == touchedLane && tile.isHeld && !tile.isHit && tile.noteType == NoteType.HOLD) {
+                val holdStartTime = tile.hitTime
+                val now = System.currentTimeMillis()
+                val heldDuration = now - holdStartTime
+
+                // Calculate expected duration from holdEndY and tile speed
+                val activeTileSpeed = currentDifficulty?.tileSpeed ?: currentSettings.tileSpeed
+                val expectedDurationMs = (tile.holdEndY / activeTileSpeed) * 17f
+
+                val holdRatio = if (expectedDurationMs > 0) (heldDuration / expectedDurationMs).coerceAtMost(1.0f) else 1.0f
+
+                val scoreGain: Int
+                val feedbackText: String
+                val feedbackColor: Int
+
+                when {
+                    holdRatio >= 0.75f -> {
+                        scoreGain = 150
+                        feedbackText = "Perfect!"
+                        feedbackColor = Color.parseColor("#FF00BCD4")
+                    }
+                    holdRatio >= 0.50f -> {
+                        scoreGain = 100
+                        feedbackText = "Good!"
+                        feedbackColor = Color.parseColor("#FF4CAF50")
+                    }
+                    holdRatio >= 0.25f -> {
+                        scoreGain = 50
+                        feedbackText = "OK!"
+                        feedbackColor = Color.parseColor("#FFFFC107")
+                    }
+                    else -> {
+                        scoreGain = 0
+                        feedbackText = "Miss"
+                        feedbackColor = Color.parseColor("#FFFF5252")
+                    }
+                }
+
+                tile.isHit = true
+                tile.holdCompleted = holdRatio >= 0.25f
+
+                if (scoreGain > 0) {
+                    val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
+                    synchronized(lock) {
+                        scoreMultiplier.onHit()
+                        healthBar.onHit()
+                        score += multipliedGain
+                        combo = scoreMultiplier.getCombo()
+                        comboAnimStartTime = System.currentTimeMillis()
+
+                        val newMultiplier = scoreMultiplier.getMultiplier()
+                        if (newMultiplier != lastMultiplierLevel) {
+                            multiplierAnimStartTime = System.currentTimeMillis()
+                            lastMultiplierLevel = newMultiplier
+                        }
+                    }
+
+                    val feedbackX = tile.lane * laneWidth + laneWidth / 2f
+                    val feedbackY = perfectLineY - 50f
+                    if (hitFeedbacks.size < 50) {
+                        hitFeedbacks.add(HitFeedback(feedbackText, feedbackX, feedbackY, 255f, System.currentTimeMillis(), feedbackColor))
+                    }
+                    if (hitFeedbacks.size < 50) {
+                        hitFeedbacks.add(HitFeedback("+$multipliedGain", 200f, 130f, 255f, System.currentTimeMillis(), Color.WHITE))
+                    }
+                    if (laneGlows.size < 20) {
+                        laneGlows.add(LaneGlow(tile.lane, System.currentTimeMillis(), feedbackColor))
+                    }
+                } else {
+                    // Miss
+                    synchronized(lock) {
+                        scoreMultiplier.onMiss()
+                        healthBar.onMiss()
+                        combo = 0
+                    }
+                    if (missFlashes.size < 10) {
+                        missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
+                    }
+                }
+                break
+            }
+        }
+    }
+
     private fun handlePausedTouch(x: Float, y: Float) {
         when {
             resumeButtonBounds.contains(x, y) -> {
@@ -1228,8 +1692,10 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             songNotes.clear()
             score = 0
             nextNoteIndex = 0
-            consecutiveMisses = 0
             combo = 0
+            scoreMultiplier.reset()
+            healthBar.reset()
+            lastMultiplierLevel = 1
         }
         isMissed = false
         hitFeedbacks.clear()
@@ -1238,9 +1704,13 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         particles.clear()
         comboAnimStartTime = 0L
         borderFlashTime = 0L
+        multiplierAnimStartTime = 0L
         currentTransition = null
         difficultyManager = null
         currentDifficulty = null
+        touchDownX.clear()
+        touchDownY.clear()
+        touchDownTime.clear()
 
         mediaPlayer?.release()
         mediaPlayer = MediaPlayer.create(appContext, selectedSong.resId)
