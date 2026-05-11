@@ -254,7 +254,15 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_DOWN) {
+        val action = event.actionMasked
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+            val pointerIndex = if (action == MotionEvent.ACTION_POINTER_DOWN) {
+                event.actionIndex
+            } else {
+                0
+            }
+            val touchX = event.getX(pointerIndex)
+
             when (gameState) {
                 GameState.START -> {
                     if (beatsReady) {
@@ -268,21 +276,23 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
                 }
                 GameState.PLAYING -> {
                     val laneWidth = width / 3f
-                    val touchedLane = (event.x / laneWidth).toInt()
+                    val touchedLane = (touchX / laneWidth).toInt()
 
-                    synchronized(tiles) {
-                        for (tile in tiles) {
-                            if (tile.lane == touchedLane && !tile.isHit) {
-                                val tileBottom = tile.y + 300f
-                                val distance = abs(tileBottom - perfectLineY)
+                    for (tile in tiles) {
+                        if (tile.lane == touchedLane && !tile.isHit) {
+                            val tileCenter = tile.y + 150f
+                            val distance = abs(tileCenter - perfectLineY)
 
-                                if (distance < 150) {
-                                    tile.isHit = true
-                                    score += 100
-                                    tiles.remove(tile)
-                                    consecutiveMisses = 0
-                                    break
+                            if (distance < 250) {
+                                tile.isHit = true
+                                score += when {
+                                    distance < 80 -> 150
+                                    distance < 160 -> 100
+                                    else -> 50
                                 }
+                                tiles.remove(tile)
+                                consecutiveMisses = 0
+                                break
                             }
                         }
                     }
