@@ -27,8 +27,12 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     private val paint = Paint()
 
     // Game State
+    @Volatile
     private var gameState = GameState.START
+    @Volatile
     private var consecutiveMisses = 0
+    @Volatile
+    private var beatsReady = false
 
     // Game Logic Variables
     private val tiles = CopyOnWriteArrayList<Tile>()
@@ -50,13 +54,21 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
         mediaPlayer?.setOnCompletionListener {
             gameState = GameState.GAME_OVER
         }
-        try {
-            val detector = BeatDetector(appContext)
-            songNotes.addAll(detector.detectBeats(R.raw.beat))
-        } catch (e: Exception) {
-            Log.w("GameView", "Beat detection failed, using fallback", e)
-            generateAutoBeats(bpm = 105, durationSecs = 240)
-        }
+        Thread {
+            try {
+                val detector = BeatDetector(appContext)
+                val beats = detector.detectBeats(R.raw.beat)
+                synchronized(songNotes) {
+                    songNotes.addAll(beats)
+                }
+            } catch (e: Exception) {
+                Log.w("GameView", "Beat detection failed, using fallback", e)
+                synchronized(songNotes) {
+                    generateAutoBeats(bpm = 105, durationSecs = 240)
+                }
+            }
+            beatsReady = true
+        }.start()
     }
 
     override fun run() {
@@ -94,12 +106,14 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             if (player.isPlaying) {
                 val currentTime = player.currentPosition
 
-                if (nextNoteIndex < songNotes.size) {
-                    val nextNote = songNotes[nextNoteIndex]
+                synchronized(songNotes) {
+                    if (nextNoteIndex < songNotes.size) {
+                        val nextNote = songNotes[nextNoteIndex]
 
-                    if (currentTime >= nextNote.timestamp - 2000) {
-                        spawnTile(nextNote.lane)
-                        nextNoteIndex++
+                        if (currentTime >= nextNote.timestamp - 2000) {
+                            spawnTile(nextNote.lane)
+                            nextNoteIndex++
+                        }
                     }
                 }
             }
@@ -163,10 +177,14 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
         paint.textAlign = Paint.Align.CENTER
         canvas.drawText("Beatstar Clone", width / 2f, height / 3f, paint)
 
-        // Draw tap to start
+        // Draw tap to start or analyzing message
         paint.color = Color.WHITE
         paint.textSize = 60f
-        canvas.drawText("Tap to Start", width / 2f, height / 2f, paint)
+        if (beatsReady) {
+            canvas.drawText("Tap to Start", width / 2f, height / 2f, paint)
+        } else {
+            canvas.drawText("Analyzing audio...", width / 2f, height / 2f, paint)
+        }
 
         paint.textAlign = Paint.Align.LEFT
     }
@@ -239,8 +257,10 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
         if (event.action == MotionEvent.ACTION_DOWN) {
             when (gameState) {
                 GameState.START -> {
-                    gameState = GameState.PLAYING
-                    mediaPlayer?.start()
+                    if (beatsReady) {
+                        gameState = GameState.PLAYING
+                        mediaPlayer?.start()
+                    }
                 }
                 GameState.GAME_OVER -> {
                     resetGame()
@@ -250,17 +270,19 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
                     val laneWidth = width / 3f
                     val touchedLane = (event.x / laneWidth).toInt()
 
-                    for (tile in tiles) {
-                        if (tile.lane == touchedLane && !tile.isHit) {
-                            val tileBottom = tile.y + 300f
-                            val distance = abs(tileBottom - perfectLineY)
+                    synchronized(tiles) {
+                        for (tile in tiles) {
+                            if (tile.lane == touchedLane && !tile.isHit) {
+                                val tileBottom = tile.y + 300f
+                                val distance = abs(tileBottom - perfectLineY)
 
-                            if (distance < 150) {
-                                tile.isHit = true
-                                score += 100
-                                tiles.remove(tile)
-                                consecutiveMisses = 0
-                                break
+                                if (distance < 150) {
+                                    tile.isHit = true
+                                    score += 100
+                                    tiles.remove(tile)
+                                    consecutiveMisses = 0
+                                    break
+                                }
                             }
                         }
                     }
@@ -272,7 +294,9 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
 
     private fun resetGame() {
         tiles.clear()
-        songNotes.clear()
+        synchronized(songNotes) {
+            songNotes.clear()
+        }
         score = 0
         nextNoteIndex = 0
         consecutiveMisses = 0
@@ -284,13 +308,22 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             gameState = GameState.GAME_OVER
         }
 
-        try {
-            val detector = BeatDetector(appContext)
-            songNotes.addAll(detector.detectBeats(R.raw.beat))
-        } catch (e: Exception) {
-            Log.w("GameView", "Beat detection failed, using fallback", e)
-            generateAutoBeats(bpm = 105, durationSecs = 240)
-        }
+        beatsReady = false
+        Thread {
+            try {
+                val detector = BeatDetector(appContext)
+                val beats = detector.detectBeats(R.raw.beat)
+                synchronized(songNotes) {
+                    songNotes.addAll(beats)
+                }
+            } catch (e: Exception) {
+                Log.w("GameView", "Beat detection failed, using fallback", e)
+                synchronized(songNotes) {
+                    generateAutoBeats(bpm = 105, durationSecs = 240)
+                }
+            }
+            beatsReady = true
+        }.start()
     }
 
     private fun control() {

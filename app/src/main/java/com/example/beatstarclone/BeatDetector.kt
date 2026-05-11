@@ -6,6 +6,8 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import java.nio.ByteOrder
 
+data class DecodeResult(val samples: ShortArray, val sampleRate: Int)
+
 class BeatDetector(private val context: Context) {
 
     companion object {
@@ -18,32 +20,12 @@ class BeatDetector(private val context: Context) {
     }
 
     fun detectBeats(rawResId: Int): List<Note> {
-        val samples = decodeAudioToSamples(rawResId)
-        val sampleRate = getSampleRate(rawResId)
-        val beatTimestamps = detectBeatTimestamps(samples, sampleRate)
+        val decodeResult = decodeAudioToSamples(rawResId)
+        val beatTimestamps = detectBeatTimestamps(decodeResult.samples, decodeResult.sampleRate)
         return assignLanes(beatTimestamps)
     }
 
-    private fun getSampleRate(rawResId: Int): Int {
-        val extractor = MediaExtractor()
-        val afd = context.resources.openRawResourceFd(rawResId)
-        extractor.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-        afd.close()
-
-        var sampleRate = 44100
-        for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith("audio/")) {
-                sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                break
-            }
-        }
-        extractor.release()
-        return sampleRate
-    }
-
-    private fun decodeAudioToSamples(rawResId: Int): ShortArray {
+    private fun decodeAudioToSamples(rawResId: Int): DecodeResult {
         val extractor = MediaExtractor()
         val afd = context.resources.openRawResourceFd(rawResId)
         extractor.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
@@ -69,6 +51,18 @@ class BeatDetector(private val context: Context) {
 
         extractor.selectTrack(audioTrackIndex)
 
+        val sampleRate = if (audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+            audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        } else {
+            44100
+        }
+
+        val channelCount = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+            audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        } else {
+            1
+        }
+
         val mime = audioFormat.getString(MediaFormat.KEY_MIME)
             ?: throw IllegalStateException("No MIME type for audio track")
         val codec = MediaCodec.createDecoderByType(mime)
@@ -81,59 +75,73 @@ class BeatDetector(private val context: Context) {
         var outputDone = false
         val timeoutUs = 10000L
 
-        while (!outputDone) {
-            // Feed input buffers
-            if (!inputDone) {
-                val inputBufferIndex = codec.dequeueInputBuffer(timeoutUs)
-                if (inputBufferIndex >= 0) {
-                    val inputBuffer = codec.getInputBuffer(inputBufferIndex)
-                    if (inputBuffer != null) {
-                        val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                        if (sampleSize < 0) {
-                            codec.queueInputBuffer(
-                                inputBufferIndex, 0, 0, 0,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
-                            inputDone = true
-                        } else {
-                            val presentationTimeUs = extractor.sampleTime
-                            codec.queueInputBuffer(
-                                inputBufferIndex, 0, sampleSize, presentationTimeUs, 0
-                            )
-                            extractor.advance()
+        try {
+            while (!outputDone) {
+                // Feed input buffers
+                if (!inputDone) {
+                    val inputBufferIndex = codec.dequeueInputBuffer(timeoutUs)
+                    if (inputBufferIndex >= 0) {
+                        val inputBuffer = codec.getInputBuffer(inputBufferIndex)
+                        if (inputBuffer != null) {
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(
+                                    inputBufferIndex, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                inputDone = true
+                            } else {
+                                val presentationTimeUs = extractor.sampleTime
+                                codec.queueInputBuffer(
+                                    inputBufferIndex, 0, sampleSize, presentationTimeUs, 0
+                                )
+                                extractor.advance()
+                            }
                         }
                     }
                 }
-            }
 
-            // Drain output buffers
-            val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
-            if (outputBufferIndex >= 0) {
-                if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                    outputDone = true
-                }
-
-                val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
-                if (outputBuffer != null && bufferInfo.size > 0) {
-                    outputBuffer.position(bufferInfo.offset)
-                    outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-
-                    val shortBuffer = outputBuffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-                    val shortCount = shortBuffer.remaining()
-                    for (i in 0 until shortCount) {
-                        pcmData.add(shortBuffer.get())
+                // Drain output buffers
+                val outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                if (outputBufferIndex >= 0) {
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        outputDone = true
                     }
-                }
 
-                codec.releaseOutputBuffer(outputBufferIndex, false)
+                    val outputBuffer = codec.getOutputBuffer(outputBufferIndex)
+                    if (outputBuffer != null && bufferInfo.size > 0) {
+                        outputBuffer.position(bufferInfo.offset)
+                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+
+                        val shortBuffer = outputBuffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                        val shortCount = shortBuffer.remaining()
+
+                        if (channelCount == 2) {
+                            // Downmix stereo to mono by averaging L+R pairs
+                            var i = 0
+                            while (i + 1 < shortCount) {
+                                val left = shortBuffer.get().toInt()
+                                val right = shortBuffer.get().toInt()
+                                pcmData.add(((left + right) / 2).toShort())
+                                i += 2
+                            }
+                        } else {
+                            for (i in 0 until shortCount) {
+                                pcmData.add(shortBuffer.get())
+                            }
+                        }
+                    }
+
+                    codec.releaseOutputBuffer(outputBufferIndex, false)
+                }
             }
+        } finally {
+            codec.stop()
+            codec.release()
+            extractor.release()
         }
 
-        codec.stop()
-        codec.release()
-        extractor.release()
-
-        return pcmData.toShortArray()
+        return DecodeResult(pcmData.toShortArray(), sampleRate)
     }
 
     private fun detectBeatTimestamps(samples: ShortArray, sampleRate: Int): List<Long> {
