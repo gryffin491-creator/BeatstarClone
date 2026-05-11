@@ -13,9 +13,12 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.random.Random
 
 // 1. DATA CLASSES
-data class Tile(var lane: Int, var y: Float, var isHit: Boolean = false)
+data class Tile(var lane: Int, var y: Float, var isHit: Boolean = false, var hitTime: Long = 0L)
 data class Note(val timestamp: Long, val lane: Int)
 
 data class HitFeedback(
@@ -26,6 +29,10 @@ data class HitFeedback(
     val createdAt: Long,
     val color: Int
 )
+
+data class LaneGlow(val lane: Int, val startTime: Long, val color: Int)
+data class MissFlash(val lane: Int, val startTime: Long)
+data class Particle(var x: Float, var y: Float, var vx: Float, var vy: Float, var alpha: Float, val createdAt: Long, val color: Int)
 
 class ScreenTransition(
     val fromState: GameState,
@@ -75,6 +82,19 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
     // Hit Feedback
     val hitFeedbacks = CopyOnWriteArrayList<HitFeedback>()
+
+    // Lane Glow effects
+    private val laneGlows = CopyOnWriteArrayList<LaneGlow>()
+
+    // Miss Flash effects
+    private val missFlashes = CopyOnWriteArrayList<MissFlash>()
+
+    // Particles
+    private val particles = CopyOnWriteArrayList<Particle>()
+
+    // Combo animation
+    private var comboAnimStartTime = 0L
+    private var borderFlashTime = 0L
 
     // Screen Transition
     var currentTransition: ScreenTransition? = null
@@ -195,6 +215,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         // 2. MOVE TILES
         for (tile in tiles) {
+            if (tile.isHit) continue
             tile.y += activeTileSpeed
 
             // Remove if off screen
@@ -213,9 +234,31 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         }
                     }
                     isMissed = true
+                    missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
                 }
             }
         }
+
+        // Remove hit tiles after animation completes (200ms)
+        val now = System.currentTimeMillis()
+        tiles.removeAll { tile -> tile.isHit && tile.hitTime > 0L && (now - tile.hitTime > 200) }
+
+        // Update hit feedbacks - remove expired ones (800ms)
+        hitFeedbacks.removeAll { feedback -> (now - feedback.createdAt) > 800 }
+
+        // Update lane glows - remove expired ones (300ms)
+        laneGlows.removeAll { glow -> (now - glow.startTime) > 300 }
+
+        // Update miss flashes - remove expired ones (200ms)
+        missFlashes.removeAll { flash -> (now - flash.startTime) > 200 }
+
+        // Update particles
+        for (particle in particles) {
+            particle.x += particle.vx
+            particle.y += particle.vy
+            particle.alpha -= 8f
+        }
+        particles.removeAll { particle -> particle.alpha <= 0f }
     }
 
     private fun spawnTile(lane: Int) {
@@ -530,18 +573,48 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         paint.style = Paint.Style.FILL
         paint.color = Color.DKGRAY
         paint.strokeWidth = 5f
+        paint.alpha = 255
         canvas.drawLine(laneWidth, 0f, laneWidth, height.toFloat(), paint)
         canvas.drawLine(laneWidth * 2, 0f, laneWidth * 2, height.toFloat(), paint)
+
+        // Draw Miss Flashes (full-height red overlay on missed lanes)
+        val currentTime = System.currentTimeMillis()
+        for (flash in missFlashes) {
+            val elapsed = currentTime - flash.startTime
+            val flashAlpha = (76 * (1f - elapsed / 200f)).toInt().coerceIn(0, 76)
+            val laneX = flash.lane * laneWidth
+            paint.color = Color.parseColor("#FF5252")
+            paint.alpha = flashAlpha
+            paint.style = Paint.Style.FILL
+            canvas.drawRect(laneX, 0f, laneX + laneWidth, height.toFloat(), paint)
+        }
+        paint.alpha = 255
+
+        // Draw Lane Glows (at hit zone)
+        for (glow in laneGlows) {
+            val elapsed = currentTime - glow.startTime
+            val glowAlpha = (180 * (1f - elapsed / 300f)).toInt().coerceIn(0, 180)
+            val laneX = glow.lane * laneWidth
+            paint.color = glow.color
+            paint.alpha = glowAlpha
+            paint.style = Paint.Style.FILL
+            canvas.drawRect(laneX, perfectLineY - 50f, laneX + laneWidth, perfectLineY + 50f, paint)
+        }
+        paint.alpha = 255
 
         // Draw Perfect Line
         paint.color = Color.CYAN
         paint.strokeWidth = 10f
+        paint.alpha = 255
         canvas.drawLine(0f, perfectLineY, width.toFloat(), perfectLineY, paint)
 
-        // Draw Tiles
+        // Draw Tiles (non-hit)
+        paint.style = Paint.Style.FILL
         paint.color = if (isMissed) Color.RED else Color.GREEN
+        paint.alpha = 255
 
         for (tile in tiles) {
+            if (tile.isHit) continue
             val tileX = tile.lane * laneWidth
             val padding = 20f
             canvas.drawRect(
@@ -553,32 +626,111 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             )
         }
 
+        // Draw hit-animating tiles (scale + fade)
+        for (tile in tiles) {
+            if (!tile.isHit || tile.hitTime == 0L) continue
+            val elapsed = currentTime - tile.hitTime
+            val animProgress = (elapsed / 200f).coerceIn(0f, 1f)
+            val scale = 1.0f + 0.3f * animProgress
+            val tileAlpha = (255 * (1f - animProgress)).toInt().coerceIn(0, 255)
+
+            val tileX = tile.lane * laneWidth
+            val padding = 20f
+            val tileCenterX = tileX + laneWidth / 2f
+            val tileCenterY = tile.y + 150f
+
+            canvas.save()
+            canvas.translate(tileCenterX, tileCenterY)
+            canvas.scale(scale, scale)
+            paint.color = Color.GREEN
+            paint.alpha = tileAlpha
+            paint.style = Paint.Style.FILL
+            canvas.drawRect(
+                -laneWidth / 2f + padding,
+                -150f,
+                laneWidth / 2f - padding,
+                150f,
+                paint
+            )
+            canvas.restore()
+        }
+        paint.alpha = 255
+
         // Reset Miss Flag after one frame
         isMissed = false
+
+        // Draw Particles
+        paint.style = Paint.Style.FILL
+        for (particle in particles) {
+            paint.color = particle.color
+            paint.alpha = particle.alpha.toInt().coerceIn(0, 255)
+            canvas.drawCircle(particle.x, particle.y, 5f, paint)
+        }
+        paint.alpha = 255
+
+        // Draw Hit Feedbacks (floating text)
+        for (feedback in hitFeedbacks) {
+            val elapsed = currentTime - feedback.createdAt
+            val animAlpha = (255 * (1f - elapsed / 800f)).toInt().coerceIn(0, 255)
+            val animY = feedback.y - (elapsed * 0.15f)
+            paint.color = feedback.color
+            paint.alpha = animAlpha
+            paint.textSize = 55f
+            paint.textAlign = Paint.Align.CENTER
+            paint.style = Paint.Style.FILL
+            canvas.drawText(feedback.text, feedback.x, animY, paint)
+        }
+        paint.alpha = 255
 
         // Draw Score
         paint.color = Color.WHITE
         paint.textSize = 80f
         paint.textAlign = Paint.Align.LEFT
         paint.style = Paint.Style.FILL
+        paint.alpha = 255
         canvas.drawText("Score: $score", 50f, 100f, paint)
 
-        // Draw Combo counter
+        // Draw Combo counter with scale animation
         synchronized(lock) {
             if (combo >= 5) {
+                val comboElapsed = currentTime - comboAnimStartTime
+                val comboScale = if (comboElapsed < 150) {
+                    1.0f + 0.4f * (1f - comboElapsed / 150f)
+                } else {
+                    1.0f
+                }
+
+                canvas.save()
+                canvas.translate(50f, 185f)
+                canvas.scale(comboScale, comboScale)
                 // Glow/shadow in cyan
                 paint.color = Color.parseColor("#00BCD4")
                 paint.textSize = 70f
                 paint.alpha = 100
                 paint.textAlign = Paint.Align.LEFT
-                canvas.drawText("x$combo", 50f, 185f, paint)
+                canvas.drawText("x$combo", 0f, 0f, paint)
                 // White text on top
                 paint.color = Color.WHITE
                 paint.textSize = 60f
                 paint.alpha = 255
-                canvas.drawText("x$combo", 50f, 185f, paint)
+                canvas.drawText("x$combo", 0f, 0f, paint)
+                canvas.restore()
             }
         }
+        paint.alpha = 255
+
+        // Draw border flash at combo milestones
+        if (currentTime - borderFlashTime < 200) {
+            val borderElapsed = currentTime - borderFlashTime
+            val borderAlpha = (255 * (1f - borderElapsed / 200f)).toInt().coerceIn(0, 255)
+            paint.color = Color.parseColor("#00BCD4")
+            paint.alpha = borderAlpha
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 8f
+            canvas.drawRect(4f, 4f, width.toFloat() - 4f, height.toFloat() - 4f, paint)
+        }
+        paint.alpha = 255
+        paint.style = Paint.Style.FILL
 
         // Draw Pause button (two vertical bars) in top-right corner
         paint.color = Color.WHITE
@@ -864,16 +1016,84 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
                 if (distance < effectiveOK) {
                     tile.isHit = true
-                    synchronized(lock) {
-                        score += when {
-                            distance < effectivePerfect -> 150
-                            distance < effectiveGood -> 100
-                            else -> 50
+                    tile.hitTime = System.currentTimeMillis()
+
+                    val scoreGain: Int
+                    val feedbackText: String
+                    val feedbackColor: Int
+
+                    when {
+                        distance < effectivePerfect -> {
+                            scoreGain = 150
+                            feedbackText = "Perfect!"
+                            feedbackColor = Color.parseColor("#FF00BCD4")
                         }
+                        distance < effectiveGood -> {
+                            scoreGain = 100
+                            feedbackText = "Good!"
+                            feedbackColor = Color.parseColor("#FF4CAF50")
+                        }
+                        else -> {
+                            scoreGain = 50
+                            feedbackText = "OK!"
+                            feedbackColor = Color.parseColor("#FFFFC107")
+                        }
+                    }
+
+                    synchronized(lock) {
+                        score += scoreGain
                         consecutiveMisses = 0
                         combo++
+                        comboAnimStartTime = System.currentTimeMillis()
+                        if (combo == 10 || combo == 25 || combo == 50 || combo == 100) {
+                            borderFlashTime = System.currentTimeMillis()
+                        }
                     }
-                    tiles.remove(tile)
+
+                    val feedbackX = tile.lane * laneWidth + laneWidth / 2f
+                    val feedbackY = perfectLineY - 50f
+
+                    // Floating hit text
+                    hitFeedbacks.add(HitFeedback(
+                        text = feedbackText,
+                        x = feedbackX,
+                        y = feedbackY,
+                        alpha = 255f,
+                        createdAt = System.currentTimeMillis(),
+                        color = feedbackColor
+                    ))
+
+                    // Score popup near score area
+                    hitFeedbacks.add(HitFeedback(
+                        text = "+$scoreGain",
+                        x = 200f,
+                        y = 130f,
+                        alpha = 255f,
+                        createdAt = System.currentTimeMillis(),
+                        color = Color.WHITE
+                    ))
+
+                    // Lane glow
+                    laneGlows.add(LaneGlow(tile.lane, System.currentTimeMillis(), feedbackColor))
+
+                    // Particle burst on Perfect hits
+                    if (distance < effectivePerfect && particles.size < 100) {
+                        val centerX = tile.lane * laneWidth + laneWidth / 2f
+                        for (i in 0 until 10) {
+                            val angle = Random.nextFloat() * (2f * Math.PI.toFloat())
+                            val speed = 3f + Random.nextFloat() * 5f
+                            particles.add(Particle(
+                                x = centerX,
+                                y = perfectLineY,
+                                vx = cos(angle) * speed,
+                                vy = sin(angle) * speed,
+                                alpha = 255f,
+                                createdAt = System.currentTimeMillis(),
+                                color = Color.parseColor("#00BCD4")
+                            ))
+                        }
+                    }
+
                     break
                 }
             }
@@ -916,6 +1136,11 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
         isMissed = false
         hitFeedbacks.clear()
+        laneGlows.clear()
+        missFlashes.clear()
+        particles.clear()
+        comboAnimStartTime = 0L
+        borderFlashTime = 0L
         currentTransition = null
         difficultyManager = null
         currentDifficulty = null
@@ -964,6 +1189,11 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
         isMissed = false
         hitFeedbacks.clear()
+        laneGlows.clear()
+        missFlashes.clear()
+        particles.clear()
+        comboAnimStartTime = 0L
+        borderFlashTime = 0L
         currentTransition = null
         difficultyManager = null
         currentDifficulty = null
