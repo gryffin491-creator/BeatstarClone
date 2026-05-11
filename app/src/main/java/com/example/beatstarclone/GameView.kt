@@ -1,9 +1,11 @@
 package com.example.beatstarclone
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.media.MediaPlayer
 import android.util.Log
 import android.view.MotionEvent
@@ -59,10 +61,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     private var nextNoteIndex = 0
 
     // Settings
-    private val tileSpeed = settings.tileSpeed
+    private var currentSettings = settings.copy()
     private var perfectLineY = 0f
     private var score = 0
     private var isMissed = false
+
+    // Combo counter
+    private var combo = 0
+
+    // Difficulty
+    private var difficultyManager: DifficultyManager? = null
+    private var currentDifficulty: DifficultyLevel? = null
 
     // Hit Feedback
     val hitFeedbacks = CopyOnWriteArrayList<HitFeedback>()
@@ -70,12 +79,35 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     // Screen Transition
     var currentTransition: ScreenTransition? = null
 
+    // Song selection
+    private var selectedSong: SongData = SongRepository.getSongs().first()
+
     // Audio
     private var mediaPlayer: MediaPlayer? = null
     private val appContext: Context = context.applicationContext
 
+    // Button bounds for touch detection
+    private val playButtonBounds = RectF()
+    private val settingsButtonBounds = RectF()
+    private val quitButtonBounds = RectF()
+    private val backButtonBounds = RectF()
+    private val songCardBounds = ArrayList<RectF>()
+    private val pauseButtonBounds = RectF()
+    private val resumeButtonBounds = RectF()
+    private val restartButtonBounds = RectF()
+    private val quitToMenuButtonBounds = RectF()
+
+    // Settings screen state
+    private val speedSliderBounds = RectF()
+    private val volumeSliderBounds = RectF()
+    private val hitWindowSmallBounds = RectF()
+    private val hitWindowMediumBounds = RectF()
+    private val hitWindowLargeBounds = RectF()
+    private var draggingSlider: Int = -1 // -1 none, 0 speed, 1 volume
+    private var hitWindowSelection: Int = 1 // 0=Small, 1=Medium, 2=Large
+
     init {
-        mediaPlayer = MediaPlayer.create(appContext, R.raw.beat)
+        mediaPlayer = MediaPlayer.create(appContext, selectedSong.resId)
         mediaPlayer?.setOnCompletionListener {
             synchronized(lock) {
                 gameState = GameState.GAME_OVER
@@ -84,14 +116,14 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         Thread {
             try {
                 val detector = BeatDetector(appContext)
-                val beats = detector.detectBeats(R.raw.beat)
+                val beats = detector.detectBeats(selectedSong.resId)
                 synchronized(songNotes) {
                     songNotes.addAll(beats)
                 }
             } catch (e: Exception) {
                 Log.w("GameView", "Beat detection failed, using fallback", e)
                 synchronized(songNotes) {
-                    generateAutoBeats(bpm = 105, durationSecs = 240)
+                    generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
                 }
             }
             beatsReady = true
@@ -128,6 +160,19 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     private fun update() {
         if (gameState != GameState.PLAYING) return
 
+        // Initialize difficulty manager if needed
+        if (difficultyManager == null) {
+            val duration = mediaPlayer?.duration?.toLong() ?: 240000L
+            difficultyManager = DifficultyManager(duration)
+        }
+
+        // Get current difficulty
+        val currentTimeMs = mediaPlayer?.currentPosition?.toLong() ?: 0L
+        val difficulty = difficultyManager?.getDifficulty(currentTimeMs, currentSettings.tileSpeed)
+        currentDifficulty = difficulty
+        val activeTileSpeed = difficulty?.tileSpeed ?: currentSettings.tileSpeed
+        val activeSpawnAhead = difficulty?.spawnAheadMs ?: 2000L
+
         // 1. MUSIC SYNC LOGIC
         mediaPlayer?.let { player ->
             if (player.isPlaying) {
@@ -138,7 +183,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         if (nextNoteIndex < songNotes.size) {
                             val nextNote = songNotes[nextNoteIndex]
 
-                            if (currentTime >= nextNote.timestamp - 2000) {
+                            if (currentTime >= nextNote.timestamp - activeSpawnAhead) {
                                 spawnTile(nextNote.lane)
                                 nextNoteIndex++
                             }
@@ -150,7 +195,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         // 2. MOVE TILES
         for (tile in tiles) {
-            tile.y += tileSpeed
+            tile.y += activeTileSpeed
 
             // Remove if off screen
             if (tile.y > height) {
@@ -159,6 +204,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     synchronized(lock) {
                         score -= 10
                         consecutiveMisses++
+                        combo = 0
 
                         if (consecutiveMisses >= 10) {
                             gameState = GameState.GAME_OVER
@@ -177,50 +223,301 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         tiles.add(newTile)
     }
 
+    private fun changeState(newState: GameState) {
+        val oldState = gameState
+        currentTransition = ScreenTransition(oldState, newState, 0f, System.currentTimeMillis())
+        gameState = newState
+    }
+
     private fun draw() {
         if (surfaceHolder.surface.isValid) {
             val canvas: Canvas = surfaceHolder.lockCanvas()
 
             when (gameState) {
-                GameState.MAIN_MENU -> drawStartScreen(canvas)
-                GameState.SONG_SELECT -> drawStartScreen(canvas)
-                GameState.SETTINGS -> drawStartScreen(canvas)
+                GameState.MAIN_MENU -> drawMainMenu(canvas)
+                GameState.SONG_SELECT -> drawSongSelect(canvas)
+                GameState.SETTINGS -> drawSettings(canvas)
                 GameState.PLAYING -> drawPlayingScreen(canvas)
-                GameState.PAUSED -> drawPlayingScreen(canvas)
+                GameState.PAUSED -> drawPauseScreen(canvas)
                 GameState.GAME_OVER -> drawGameOverScreen(canvas)
+            }
+
+            // Apply transition overlay
+            currentTransition?.let { transition ->
+                val elapsed = System.currentTimeMillis() - transition.startTime
+                val progress = (elapsed / 300f).coerceIn(0f, 1f)
+                transition.progress = progress
+                if (progress >= 1.0f) {
+                    currentTransition = null
+                }
             }
 
             surfaceHolder.unlockCanvasAndPost(canvas)
         }
     }
 
-    private fun drawStartScreen(canvas: Canvas) {
-        canvas.drawColor(Color.BLACK)
+    private fun drawMainMenu(canvas: Canvas) {
+        canvas.drawColor(Color.parseColor("#0D0D0D"))
 
-        val laneWidth = width / 3f
+        val centerX = width / 2f
+        val buttonWidth = width * 0.6f
+        val buttonHeight = 120f
+        val buttonSpacing = 40f
 
-        // Draw faint lane lines for visual appeal
-        paint.color = Color.argb(60, 100, 100, 100)
-        paint.strokeWidth = 3f
-        canvas.drawLine(laneWidth, 0f, laneWidth, height.toFloat(), paint)
-        canvas.drawLine(laneWidth * 2, 0f, laneWidth * 2, height.toFloat(), paint)
-
-        // Draw title
-        paint.color = Color.CYAN
+        // Title
+        paint.isAntiAlias = true
+        paint.color = Color.parseColor("#00BCD4")
         paint.textSize = 100f
         paint.textAlign = Paint.Align.CENTER
-        canvas.drawText("Beatstar Clone", width / 2f, height / 3f, paint)
+        paint.style = Paint.Style.FILL
+        canvas.drawText("Beatstar Clone", centerX, height / 3f, paint)
 
-        // Draw tap to start or analyzing message
-        paint.color = Color.WHITE
-        paint.textSize = 60f
-        if (beatsReady) {
-            canvas.drawText("Tap to Start", width / 2f, height / 2f, paint)
-        } else {
-            canvas.drawText("Analyzing audio...", width / 2f, height / 2f, paint)
-        }
+        // Buttons starting from center
+        val startY = height / 2f
+
+        // Play button
+        val playLeft = centerX - buttonWidth / 2f
+        val playTop = startY
+        playButtonBounds.set(playLeft, playTop, playLeft + buttonWidth, playTop + buttonHeight)
+        drawMenuButton(canvas, playButtonBounds, "Play", Color.parseColor("#00BCD4"))
+
+        // Settings button
+        val settingsTop = playTop + buttonHeight + buttonSpacing
+        settingsButtonBounds.set(playLeft, settingsTop, playLeft + buttonWidth, settingsTop + buttonHeight)
+        drawMenuButton(canvas, settingsButtonBounds, "Settings", Color.parseColor("#00BCD4"))
+
+        // Quit button
+        val quitTop = settingsTop + buttonHeight + buttonSpacing
+        quitButtonBounds.set(playLeft, quitTop, playLeft + buttonWidth, quitTop + buttonHeight)
+        drawMenuButton(canvas, quitButtonBounds, "Quit", Color.parseColor("#FF5252"))
 
         paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawMenuButton(canvas: Canvas, bounds: RectF, text: String, accentColor: Int) {
+        paint.isAntiAlias = true
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 4f
+        paint.color = accentColor
+        canvas.drawRoundRect(bounds, 20f, 20f, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = Color.WHITE
+        paint.textSize = 50f
+        paint.textAlign = Paint.Align.CENTER
+        val textY = bounds.centerY() + 18f
+        canvas.drawText(text, bounds.centerX(), textY, paint)
+    }
+
+    private fun drawSongSelect(canvas: Canvas) {
+        canvas.drawColor(Color.parseColor("#0D0D0D"))
+
+        paint.isAntiAlias = true
+        paint.color = Color.parseColor("#00BCD4")
+        paint.textSize = 80f
+        paint.textAlign = Paint.Align.CENTER
+        paint.style = Paint.Style.FILL
+        canvas.drawText("Select Song", width / 2f, 150f, paint)
+
+        val songs = SongRepository.getSongs()
+        songCardBounds.clear()
+
+        val cardPadding = 30f
+        val cardHeight = 180f
+        val cardSpacing = 20f
+        var cardY = 220f
+
+        for (song in songs) {
+            val cardLeft = cardPadding
+            val cardRight = width - cardPadding
+            val cardBounds = RectF(cardLeft, cardY, cardRight, cardY + cardHeight)
+            songCardBounds.add(cardBounds)
+
+            // Card background
+            paint.style = Paint.Style.FILL
+            paint.color = Color.parseColor("#1A1A1A")
+            canvas.drawRoundRect(cardBounds, 16f, 16f, paint)
+
+            // Song title
+            paint.color = Color.WHITE
+            paint.textSize = 50f
+            paint.textAlign = Paint.Align.LEFT
+            canvas.drawText(song.title, cardLeft + 30f, cardY + 60f, paint)
+
+            // Artist
+            paint.color = Color.parseColor("#888888")
+            paint.textSize = 36f
+            canvas.drawText(song.artist, cardLeft + 30f, cardY + 105f, paint)
+
+            // Difficulty badge
+            paint.color = when (song.difficulty) {
+                "Easy" -> Color.parseColor("#4CAF50")
+                "Medium" -> Color.parseColor("#FFC107")
+                "Hard" -> Color.parseColor("#F44336")
+                else -> Color.WHITE
+            }
+            paint.textSize = 36f
+            paint.textAlign = Paint.Align.RIGHT
+            canvas.drawText(song.difficulty, cardRight - 30f, cardY + 60f, paint)
+
+            // BPM
+            paint.color = Color.parseColor("#888888")
+            paint.textSize = 30f
+            canvas.drawText("${song.bpm} BPM", cardRight - 30f, cardY + 105f, paint)
+
+            cardY += cardHeight + cardSpacing
+        }
+
+        // Back button at bottom
+        val backWidth = 200f
+        val backHeight = 80f
+        val backLeft = width / 2f - backWidth / 2f
+        val backTop = height - 150f
+        backButtonBounds.set(backLeft, backTop, backLeft + backWidth, backTop + backHeight)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f
+        paint.color = Color.parseColor("#888888")
+        canvas.drawRoundRect(backButtonBounds, 16f, 16f, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = Color.WHITE
+        paint.textSize = 40f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText("Back", backButtonBounds.centerX(), backButtonBounds.centerY() + 14f, paint)
+
+        paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawSettings(canvas: Canvas) {
+        canvas.drawColor(Color.parseColor("#0D0D0D"))
+
+        paint.isAntiAlias = true
+        paint.color = Color.parseColor("#00BCD4")
+        paint.textSize = 80f
+        paint.textAlign = Paint.Align.CENTER
+        paint.style = Paint.Style.FILL
+        canvas.drawText("Settings", width / 2f, 150f, paint)
+
+        val sliderLeft = 80f
+        val sliderRight = width - 80f
+        val sliderWidth = sliderRight - sliderLeft
+
+        // Tile Speed slider
+        var sliderY = 300f
+        paint.color = Color.WHITE
+        paint.textSize = 44f
+        paint.textAlign = Paint.Align.LEFT
+        canvas.drawText("Tile Speed: ${currentSettings.tileSpeed.toInt()}", sliderLeft, sliderY, paint)
+
+        sliderY += 60f
+        speedSliderBounds.set(sliderLeft, sliderY - 6f, sliderRight, sliderY + 6f)
+
+        // Track
+        paint.color = Color.parseColor("#333333")
+        paint.style = Paint.Style.FILL
+        canvas.drawRoundRect(RectF(sliderLeft, sliderY - 6f, sliderRight, sliderY + 6f), 6f, 6f, paint)
+
+        // Fill
+        val speedProgress = ((currentSettings.tileSpeed - 10f) / 15f).coerceIn(0f, 1f)
+        val speedFillX = sliderLeft + sliderWidth * speedProgress
+        paint.color = Color.parseColor("#00BCD4")
+        canvas.drawRoundRect(RectF(sliderLeft, sliderY - 6f, speedFillX, sliderY + 6f), 6f, 6f, paint)
+
+        // Knob
+        paint.color = Color.WHITE
+        canvas.drawCircle(speedFillX, sliderY, 20f, paint)
+
+        // Volume slider
+        sliderY += 120f
+        paint.color = Color.WHITE
+        paint.textSize = 44f
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        val volumePercent = (currentSettings.volume * 100).toInt()
+        canvas.drawText("Volume: $volumePercent%", sliderLeft, sliderY, paint)
+
+        sliderY += 60f
+        volumeSliderBounds.set(sliderLeft, sliderY - 6f, sliderRight, sliderY + 6f)
+
+        // Track
+        paint.color = Color.parseColor("#333333")
+        canvas.drawRoundRect(RectF(sliderLeft, sliderY - 6f, sliderRight, sliderY + 6f), 6f, 6f, paint)
+
+        // Fill
+        val volumeProgress = currentSettings.volume.coerceIn(0f, 1f)
+        val volumeFillX = sliderLeft + sliderWidth * volumeProgress
+        paint.color = Color.parseColor("#00BCD4")
+        canvas.drawRoundRect(RectF(sliderLeft, sliderY - 6f, volumeFillX, sliderY + 6f), 6f, 6f, paint)
+
+        // Knob
+        paint.color = Color.WHITE
+        canvas.drawCircle(volumeFillX, sliderY, 20f, paint)
+
+        // Hit Window options
+        sliderY += 120f
+        paint.color = Color.WHITE
+        paint.textSize = 44f
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        canvas.drawText("Hit Window:", sliderLeft, sliderY, paint)
+
+        sliderY += 60f
+        val optionWidth = (sliderWidth - 40f) / 3f
+        val optionHeight = 70f
+
+        // Small button
+        hitWindowSmallBounds.set(sliderLeft, sliderY, sliderLeft + optionWidth, sliderY + optionHeight)
+        drawOptionButton(canvas, hitWindowSmallBounds, "Small", hitWindowSelection == 0)
+
+        // Medium button
+        val medLeft = sliderLeft + optionWidth + 20f
+        hitWindowMediumBounds.set(medLeft, sliderY, medLeft + optionWidth, sliderY + optionHeight)
+        drawOptionButton(canvas, hitWindowMediumBounds, "Medium", hitWindowSelection == 1)
+
+        // Large button
+        val largeLeft = medLeft + optionWidth + 20f
+        hitWindowLargeBounds.set(largeLeft, sliderY, largeLeft + optionWidth, sliderY + optionHeight)
+        drawOptionButton(canvas, hitWindowLargeBounds, "Large", hitWindowSelection == 2)
+
+        // Back button at bottom
+        val backWidth = 200f
+        val backHeight = 80f
+        val backLeft = width / 2f - backWidth / 2f
+        val backTop = height - 150f
+        backButtonBounds.set(backLeft, backTop, backLeft + backWidth, backTop + backHeight)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f
+        paint.color = Color.parseColor("#888888")
+        canvas.drawRoundRect(backButtonBounds, 16f, 16f, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = Color.WHITE
+        paint.textSize = 40f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText("Back", backButtonBounds.centerX(), backButtonBounds.centerY() + 14f, paint)
+
+        paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawOptionButton(canvas: Canvas, bounds: RectF, text: String, selected: Boolean) {
+        if (selected) {
+            paint.style = Paint.Style.FILL
+            paint.color = Color.parseColor("#00BCD4")
+            canvas.drawRoundRect(bounds, 12f, 12f, paint)
+            paint.color = Color.WHITE
+        } else {
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 3f
+            paint.color = Color.parseColor("#888888")
+            canvas.drawRoundRect(bounds, 12f, 12f, paint)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.parseColor("#888888")
+        }
+        paint.textSize = 36f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText(text, bounds.centerX(), bounds.centerY() + 12f, paint)
     }
 
     private fun drawPlayingScreen(canvas: Canvas) {
@@ -230,6 +527,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         perfectLineY = height * 0.8f
 
         // Draw Lanes
+        paint.style = Paint.Style.FILL
         paint.color = Color.DKGRAY
         paint.strokeWidth = 5f
         canvas.drawLine(laneWidth, 0f, laneWidth, height.toFloat(), paint)
@@ -262,16 +560,119 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         paint.color = Color.WHITE
         paint.textSize = 80f
         paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
         canvas.drawText("Score: $score", 50f, 100f, paint)
+
+        // Draw Combo counter
+        synchronized(lock) {
+            if (combo >= 5) {
+                // Glow/shadow in cyan
+                paint.color = Color.parseColor("#00BCD4")
+                paint.textSize = 70f
+                paint.alpha = 100
+                paint.textAlign = Paint.Align.LEFT
+                canvas.drawText("x$combo", 50f, 185f, paint)
+                // White text on top
+                paint.color = Color.WHITE
+                paint.textSize = 60f
+                paint.alpha = 255
+                canvas.drawText("x$combo", 50f, 185f, paint)
+            }
+        }
+
+        // Draw Pause button (two vertical bars) in top-right corner
+        paint.color = Color.WHITE
+        paint.style = Paint.Style.FILL
+        val pauseX = width - 120f
+        val pauseY = 40f
+        pauseButtonBounds.set(pauseX - 20f, pauseY - 10f, pauseX + 40f, pauseY + 60f)
+        canvas.drawRect(pauseX, pauseY, pauseX + 8f, pauseY + 50f, paint)
+        canvas.drawRect(pauseX + 20f, pauseY, pauseX + 28f, pauseY + 50f, paint)
+
+        paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawPauseScreen(canvas: Canvas) {
+        // Draw the frozen game state first
+        canvas.drawColor(Color.BLACK)
+
+        val laneWidth = width / 3f
+        perfectLineY = height * 0.8f
+
+        // Draw Lanes
+        paint.style = Paint.Style.FILL
+        paint.color = Color.DKGRAY
+        paint.strokeWidth = 5f
+        canvas.drawLine(laneWidth, 0f, laneWidth, height.toFloat(), paint)
+        canvas.drawLine(laneWidth * 2, 0f, laneWidth * 2, height.toFloat(), paint)
+
+        // Draw Perfect Line
+        paint.color = Color.CYAN
+        paint.strokeWidth = 10f
+        canvas.drawLine(0f, perfectLineY, width.toFloat(), perfectLineY, paint)
+
+        // Draw Tiles (frozen)
+        paint.color = Color.GREEN
+        for (tile in tiles) {
+            val tileX = tile.lane * laneWidth
+            val padding = 20f
+            canvas.drawRect(
+                tileX + padding,
+                tile.y,
+                tileX + laneWidth - padding,
+                tile.y + 300f,
+                paint
+            )
+        }
+
+        // Score
+        paint.color = Color.WHITE
+        paint.textSize = 80f
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        canvas.drawText("Score: $score", 50f, 100f, paint)
+
+        // Semi-transparent overlay
+        paint.color = Color.argb(200, 0, 0, 0)
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+
+        // PAUSED text
+        paint.color = Color.WHITE
+        paint.textSize = 120f
+        paint.textAlign = Paint.Align.CENTER
+        canvas.drawText("PAUSED", width / 2f, height / 3f, paint)
+
+        // Buttons
+        val centerX = width / 2f
+        val buttonWidth = width * 0.6f
+        val buttonHeight = 120f
+        val buttonSpacing = 40f
+        val startY = height / 2f
+
+        val resumeLeft = centerX - buttonWidth / 2f
+        resumeButtonBounds.set(resumeLeft, startY, resumeLeft + buttonWidth, startY + buttonHeight)
+        drawMenuButton(canvas, resumeButtonBounds, "Resume", Color.parseColor("#00BCD4"))
+
+        val restartTop = startY + buttonHeight + buttonSpacing
+        restartButtonBounds.set(resumeLeft, restartTop, resumeLeft + buttonWidth, restartTop + buttonHeight)
+        drawMenuButton(canvas, restartButtonBounds, "Restart", Color.WHITE)
+
+        val quitTop = restartTop + buttonHeight + buttonSpacing
+        quitToMenuButtonBounds.set(resumeLeft, quitTop, resumeLeft + buttonWidth, quitTop + buttonHeight)
+        drawMenuButton(canvas, quitToMenuButtonBounds, "Quit to Menu", Color.parseColor("#888888"))
+
+        paint.textAlign = Paint.Align.LEFT
     }
 
     private fun drawGameOverScreen(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
 
         // Draw Game Over
+        paint.isAntiAlias = true
         paint.color = Color.RED
         paint.textSize = 120f
         paint.textAlign = Paint.Align.CENTER
+        paint.style = Paint.Style.FILL
         canvas.drawText("Game Over", width / 2f, height / 3f, paint)
 
         // Draw Score
@@ -289,60 +690,265 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val action = event.actionMasked
-        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
-            val pointerIndex = if (action == MotionEvent.ACTION_POINTER_DOWN) {
-                event.actionIndex
-            } else {
-                0
-            }
-            val touchX = event.getX(pointerIndex)
+        val touchX = event.x
+        val touchY = event.y
 
-            when (gameState) {
-                GameState.MAIN_MENU -> {
-                    if (beatsReady) {
+        when (action) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val pointerIndex = if (action == MotionEvent.ACTION_POINTER_DOWN) {
+                    event.actionIndex
+                } else {
+                    0
+                }
+                val pX = event.getX(pointerIndex)
+                val pY = event.getY(pointerIndex)
+
+                when (gameState) {
+                    GameState.MAIN_MENU -> handleMainMenuTouch(pX, pY)
+                    GameState.SONG_SELECT -> handleSongSelectTouch(pX, pY)
+                    GameState.SETTINGS -> handleSettingsDown(pX, pY)
+                    GameState.PLAYING -> handlePlayingTouch(pX, pY)
+                    GameState.PAUSED -> handlePausedTouch(pX, pY)
+                    GameState.GAME_OVER -> {
+                        resetGame()
                         synchronized(lock) {
-                            gameState = GameState.PLAYING
-                        }
-                        mediaPlayer?.start()
-                    }
-                }
-                GameState.GAME_OVER -> {
-                    resetGame()
-                    synchronized(lock) {
-                        gameState = GameState.MAIN_MENU
-                    }
-                }
-                GameState.PLAYING -> {
-                    val laneWidth = width / 3f
-                    val touchedLane = (touchX / laneWidth).toInt()
-
-                    for (tile in tiles) {
-                        if (tile.lane == touchedLane && !tile.isHit) {
-                            val tileCenter = tile.y + 150f
-                            val distance = abs(tileCenter - perfectLineY)
-
-                            if (distance < settings.hitWindowOK) {
-                                tile.isHit = true
-                                synchronized(lock) {
-                                    score += when {
-                                        distance < settings.hitWindowPerfect -> 150
-                                        distance < settings.hitWindowGood -> 100
-                                        else -> 50
-                                    }
-                                    consecutiveMisses = 0
-                                }
-                                tiles.remove(tile)
-                                break
-                            }
+                            changeState(GameState.MAIN_MENU)
                         }
                     }
                 }
-                GameState.SONG_SELECT -> { /* placeholder */ }
-                GameState.SETTINGS -> { /* placeholder */ }
-                GameState.PAUSED -> { /* placeholder */ }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (gameState == GameState.SETTINGS) {
+                    handleSettingsMove(touchX, touchY)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                if (gameState == GameState.SETTINGS) {
+                    draggingSlider = -1
+                }
             }
         }
         return true
+    }
+
+    private fun handleMainMenuTouch(x: Float, y: Float) {
+        when {
+            playButtonBounds.contains(x, y) -> {
+                synchronized(lock) {
+                    changeState(GameState.SONG_SELECT)
+                }
+            }
+            settingsButtonBounds.contains(x, y) -> {
+                synchronized(lock) {
+                    changeState(GameState.SETTINGS)
+                }
+            }
+            quitButtonBounds.contains(x, y) -> {
+                val activity = context as? Activity
+                activity?.finish()
+            }
+        }
+    }
+
+    private fun handleSongSelectTouch(x: Float, y: Float) {
+        // Check song cards
+        val songs = SongRepository.getSongs()
+        for (i in songCardBounds.indices) {
+            if (i < songs.size && songCardBounds[i].contains(x, y)) {
+                selectedSong = songs[i]
+                startGameWithSong()
+                return
+            }
+        }
+        // Check back button
+        if (backButtonBounds.contains(x, y)) {
+            synchronized(lock) {
+                changeState(GameState.MAIN_MENU)
+            }
+        }
+    }
+
+    private fun handleSettingsDown(x: Float, y: Float) {
+        // Check sliders with expanded touch area
+        val expandedSpeed = RectF(speedSliderBounds)
+        expandedSpeed.top -= 30f
+        expandedSpeed.bottom += 30f
+        val expandedVolume = RectF(volumeSliderBounds)
+        expandedVolume.top -= 30f
+        expandedVolume.bottom += 30f
+
+        when {
+            expandedSpeed.contains(x, y) -> {
+                draggingSlider = 0
+                updateSpeedFromTouch(x)
+            }
+            expandedVolume.contains(x, y) -> {
+                draggingSlider = 1
+                updateVolumeFromTouch(x)
+            }
+            hitWindowSmallBounds.contains(x, y) -> {
+                hitWindowSelection = 0
+                currentSettings = currentSettings.copy(
+                    hitWindowPerfect = 56f,
+                    hitWindowGood = 112f,
+                    hitWindowOK = 175f
+                )
+            }
+            hitWindowMediumBounds.contains(x, y) -> {
+                hitWindowSelection = 1
+                currentSettings = currentSettings.copy(
+                    hitWindowPerfect = 80f,
+                    hitWindowGood = 160f,
+                    hitWindowOK = 250f
+                )
+            }
+            hitWindowLargeBounds.contains(x, y) -> {
+                hitWindowSelection = 2
+                currentSettings = currentSettings.copy(
+                    hitWindowPerfect = 104f,
+                    hitWindowGood = 208f,
+                    hitWindowOK = 325f
+                )
+            }
+            backButtonBounds.contains(x, y) -> {
+                synchronized(lock) {
+                    changeState(GameState.MAIN_MENU)
+                }
+            }
+        }
+    }
+
+    private fun handleSettingsMove(x: Float, y: Float) {
+        when (draggingSlider) {
+            0 -> updateSpeedFromTouch(x)
+            1 -> updateVolumeFromTouch(x)
+        }
+    }
+
+    private fun updateSpeedFromTouch(x: Float) {
+        val progress = ((x - speedSliderBounds.left) / speedSliderBounds.width()).coerceIn(0f, 1f)
+        val newSpeed = 10f + progress * 15f
+        currentSettings = currentSettings.copy(tileSpeed = newSpeed)
+    }
+
+    private fun updateVolumeFromTouch(x: Float) {
+        val progress = ((x - volumeSliderBounds.left) / volumeSliderBounds.width()).coerceIn(0f, 1f)
+        currentSettings = currentSettings.copy(volume = progress)
+        mediaPlayer?.setVolume(progress, progress)
+    }
+
+    private fun handlePlayingTouch(x: Float, y: Float) {
+        // Check pause button
+        if (pauseButtonBounds.contains(x, y)) {
+            synchronized(lock) {
+                changeState(GameState.PAUSED)
+            }
+            mediaPlayer?.pause()
+            return
+        }
+
+        // Existing tile tap logic
+        val laneWidth = width / 3f
+        val touchedLane = (x / laneWidth).toInt()
+
+        val hitWindowMult = currentDifficulty?.hitWindowMultiplier ?: 1.0f
+
+        for (tile in tiles) {
+            if (tile.lane == touchedLane && !tile.isHit) {
+                val tileCenter = tile.y + 150f
+                val distance = abs(tileCenter - perfectLineY)
+
+                val effectiveOK = currentSettings.hitWindowOK * hitWindowMult
+                val effectivePerfect = currentSettings.hitWindowPerfect * hitWindowMult
+                val effectiveGood = currentSettings.hitWindowGood * hitWindowMult
+
+                if (distance < effectiveOK) {
+                    tile.isHit = true
+                    synchronized(lock) {
+                        score += when {
+                            distance < effectivePerfect -> 150
+                            distance < effectiveGood -> 100
+                            else -> 50
+                        }
+                        consecutiveMisses = 0
+                        combo++
+                    }
+                    tiles.remove(tile)
+                    break
+                }
+            }
+        }
+    }
+
+    private fun handlePausedTouch(x: Float, y: Float) {
+        when {
+            resumeButtonBounds.contains(x, y) -> {
+                synchronized(lock) {
+                    changeState(GameState.PLAYING)
+                }
+                mediaPlayer?.start()
+            }
+            restartButtonBounds.contains(x, y) -> {
+                resetGame()
+                synchronized(lock) {
+                    changeState(GameState.MAIN_MENU)
+                }
+            }
+            quitToMenuButtonBounds.contains(x, y) -> {
+                resetGame()
+                synchronized(lock) {
+                    changeState(GameState.MAIN_MENU)
+                }
+            }
+        }
+    }
+
+    private fun startGameWithSong() {
+        tiles.clear()
+        synchronized(songNotes) {
+            songNotes.clear()
+        }
+        synchronized(lock) {
+            score = 0
+            nextNoteIndex = 0
+            consecutiveMisses = 0
+            combo = 0
+        }
+        isMissed = false
+        hitFeedbacks.clear()
+        currentTransition = null
+        difficultyManager = null
+        currentDifficulty = null
+
+        mediaPlayer?.release()
+        mediaPlayer = MediaPlayer.create(appContext, selectedSong.resId)
+        mediaPlayer?.setVolume(currentSettings.volume, currentSettings.volume)
+        mediaPlayer?.setOnCompletionListener {
+            synchronized(lock) {
+                gameState = GameState.GAME_OVER
+            }
+        }
+
+        beatsReady = false
+        Thread {
+            try {
+                val detector = BeatDetector(appContext)
+                val beats = detector.detectBeats(selectedSong.resId)
+                synchronized(songNotes) {
+                    songNotes.addAll(beats)
+                }
+            } catch (e: Exception) {
+                Log.w("GameView", "Beat detection failed, using fallback", e)
+                synchronized(songNotes) {
+                    generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
+                }
+            }
+            beatsReady = true
+            synchronized(lock) {
+                changeState(GameState.PLAYING)
+            }
+            mediaPlayer?.start()
+        }.start()
     }
 
     private fun resetGame() {
@@ -354,13 +960,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             score = 0
             nextNoteIndex = 0
             consecutiveMisses = 0
+            combo = 0
         }
         isMissed = false
         hitFeedbacks.clear()
         currentTransition = null
+        difficultyManager = null
+        currentDifficulty = null
 
         mediaPlayer?.release()
-        mediaPlayer = MediaPlayer.create(appContext, R.raw.beat)
+        mediaPlayer = MediaPlayer.create(appContext, selectedSong.resId)
+        mediaPlayer?.setVolume(currentSettings.volume, currentSettings.volume)
         mediaPlayer?.setOnCompletionListener {
             synchronized(lock) {
                 gameState = GameState.GAME_OVER
@@ -371,14 +981,14 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         Thread {
             try {
                 val detector = BeatDetector(appContext)
-                val beats = detector.detectBeats(R.raw.beat)
+                val beats = detector.detectBeats(selectedSong.resId)
                 synchronized(songNotes) {
                     songNotes.addAll(beats)
                 }
             } catch (e: Exception) {
                 Log.w("GameView", "Beat detection failed, using fallback", e)
                 synchronized(songNotes) {
-                    generateAutoBeats(bpm = 105, durationSecs = 240)
+                    generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
                 }
             }
             beatsReady = true
