@@ -38,15 +38,8 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     private var mediaPlayer: MediaPlayer? = null
 
     init {
-        // LOAD AUDIO
-        // Make sure the file is named 'unity.mp3' in res/raw/
         mediaPlayer = MediaPlayer.create(context, R.raw.beat)
-
-        // --- THE "UNITY" BEAT MAP ---
-        // The song starts quiet. Let's wait for the first melody kick (approx 2 seconds in).
-        // 105 BPM = A beat roughly every 570ms.
-// AUTOMATICALLY GENERATE THE WHOLE SONG
-        generateAutoBeats(bpm = 105, durationSecs = 240) // 4 minutes
+        generateAutoBeats(bpm = 105, durationSecs = 240)
     }
 
     override fun run() {
@@ -55,14 +48,6 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             draw()
             control()
         }
-    }
-
-    init {
-        // Load Audio
-        mediaPlayer = MediaPlayer.create(context, R.raw.beat)
-
-        // AUTOMATICALLY GENERATE THE WHOLE SONG
-        generateAutoBeats(bpm = 105, durationSecs = 240) // 4 minutes
     }
 
     // --- THE AUTOMATION ENGINE ---
