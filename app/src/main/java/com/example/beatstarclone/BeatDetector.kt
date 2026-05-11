@@ -11,12 +11,13 @@ data class DecodeResult(val samples: ShortArray, val sampleRate: Int)
 class BeatDetector(private val context: Context) {
 
     companion object {
-        private const val WINDOW_SIZE = 1024
+        private const val WINDOW_SIZE = 2048
         private const val HISTORY_SIZE = 43
         private const val THRESHOLD_MULTIPLIER = 1.5
-        private const val MIN_BEAT_INTERVAL_MS = 200L
+        private const val MIN_BEAT_INTERVAL_MS = 280L
         private const val NUM_LANES = 3
         private const val CLOSE_BEAT_THRESHOLD_MS = 300L
+        private const val LOW_PASS_CUTOFF_HZ = 150.0
     }
 
     fun detectBeats(rawResId: Int): List<Note> {
@@ -145,34 +146,54 @@ class BeatDetector(private val context: Context) {
     }
 
     private fun detectBeatTimestamps(samples: ShortArray, sampleRate: Int): List<Long> {
+        // Apply single-pole IIR low-pass filter to isolate bass/kick frequencies
+        val alpha = (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ) /
+            (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ + sampleRate)
+        val filtered = DoubleArray(samples.size)
+        filtered[0] = alpha * (samples[0].toDouble() / Short.MAX_VALUE)
+        for (i in 1 until samples.size) {
+            val sample = samples[i].toDouble() / Short.MAX_VALUE
+            filtered[i] = alpha * sample + (1.0 - alpha) * filtered[i - 1]
+        }
+
+        // Compute energy per window from filtered (bass) signal
+        val totalWindows = filtered.size / WINDOW_SIZE
+        val windowEnergies = DoubleArray(totalWindows)
+        for (windowIndex in 0 until totalWindows) {
+            val startSample = windowIndex * WINDOW_SIZE
+            var sumSquared = 0.0
+            for (i in startSample until startSample + WINDOW_SIZE) {
+                sumSquared += filtered[i] * filtered[i]
+            }
+            windowEnergies[windowIndex] = Math.sqrt(sumSquared / WINDOW_SIZE)
+        }
+
+        // Adaptive thresholding with peak-picking
         val beats = ArrayList<Long>()
         val energyHistory = ArrayList<Double>(HISTORY_SIZE)
-
-        val totalWindows = samples.size / WINDOW_SIZE
         var lastBeatTimeMs = -MIN_BEAT_INTERVAL_MS * 2
 
         for (windowIndex in 0 until totalWindows) {
-            val startSample = windowIndex * WINDOW_SIZE
-            val endSample = startSample + WINDOW_SIZE
+            val energy = windowEnergies[windowIndex]
 
-            // Compute RMS energy for this window
-            var sumSquared = 0.0
-            for (i in startSample until endSample) {
-                val sample = samples[i].toDouble() / Short.MAX_VALUE
-                sumSquared += sample * sample
+            // Check if current window is a local peak (greater than neighbors)
+            val isLocalPeak = when {
+                windowIndex == 0 -> energy > windowEnergies.getOrElse(1) { 0.0 }
+                windowIndex == totalWindows - 1 -> energy > windowEnergies[windowIndex - 1]
+                else -> energy > windowEnergies[windowIndex - 1] &&
+                    energy > windowEnergies[windowIndex + 1]
             }
-            val rmsEnergy = Math.sqrt(sumSquared / WINDOW_SIZE)
 
-            // Compute rolling average
+            // Compute rolling average for adaptive threshold
             val averageEnergy = if (energyHistory.isNotEmpty()) {
                 energyHistory.sum() / energyHistory.size
             } else {
-                rmsEnergy
+                energy
             }
 
-            // Check if this window is a beat
-            val timestampMs = (startSample.toLong() * 1000L) / sampleRate
-            if (rmsEnergy > averageEnergy * THRESHOLD_MULTIPLIER &&
+            val timestampMs = (windowIndex.toLong() * WINDOW_SIZE * 1000L) / sampleRate
+            if (isLocalPeak &&
+                energy > averageEnergy * THRESHOLD_MULTIPLIER &&
                 timestampMs - lastBeatTimeMs >= MIN_BEAT_INTERVAL_MS
             ) {
                 beats.add(timestampMs)
@@ -180,7 +201,7 @@ class BeatDetector(private val context: Context) {
             }
 
             // Update history
-            energyHistory.add(rmsEnergy)
+            energyHistory.add(energy)
             if (energyHistory.size > HISTORY_SIZE) {
                 energyHistory.removeAt(0)
             }
