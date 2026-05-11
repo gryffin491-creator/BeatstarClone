@@ -16,6 +16,13 @@ object SongRepository {
             artist = "Unknown Artist",
             difficulty = "Medium",
             bpm = 105
+        ),
+        SongData(
+            resId = R.raw.elektronomia_sky_high,
+            title = "Sky High",
+            artist = "Elektronomia",
+            difficulty = "Hard",
+            bpm = 128
         )
     )
 }

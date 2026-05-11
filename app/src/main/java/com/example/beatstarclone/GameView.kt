@@ -41,9 +41,23 @@ class ScreenTransition(
     val startTime: Long
 )
 
-enum class GameState { MAIN_MENU, SONG_SELECT, SETTINGS, PLAYING, PAUSED, GAME_OVER }
+enum class GameState { MAIN_MENU, SONG_SELECT, SETTINGS, COUNTDOWN, PLAYING, PAUSED, GAME_OVER }
 
 class GameView(context: Context, private val settings: GameSettings = GameSettings.DEFAULT) : SurfaceView(context), Runnable {
+
+    // Lane colors
+    private val laneColors = intArrayOf(
+        Color.parseColor("#FF00FF"),  // Lane 0: magenta
+        Color.parseColor("#00E5FF"),  // Lane 1: cyan
+        Color.parseColor("#FFD700")   // Lane 2: gold
+    )
+
+    private fun getLaneColor(lane: Int): Int {
+        return laneColors[lane.coerceIn(0, 2)]
+    }
+
+    // Countdown
+    private var countdownStartTime: Long = 0L
 
     // System Variables
     private var playing = false
@@ -180,6 +194,16 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     }
 
     private fun update() {
+        if (gameState == GameState.COUNTDOWN) {
+            val elapsed = System.currentTimeMillis() - countdownStartTime
+            if (elapsed > 3700L) {
+                synchronized(lock) {
+                    changeState(GameState.PLAYING)
+                }
+                safeMediaStart()
+            }
+            return
+        }
         if (gameState != GameState.PLAYING) return
 
         // Initialize difficulty manager if needed
@@ -204,7 +228,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     if (nextNoteIndex < songNotes.size) {
                         val nextNote = songNotes[nextNoteIndex]
 
-                        if (currentTime >= nextNote.timestamp - activeSpawnAhead) {
+                        if (currentTime + currentSettings.audioOffsetMs >= nextNote.timestamp - activeSpawnAhead) {
                             spawnTile(nextNote.lane)
                             nextNoteIndex++
                         }
@@ -216,10 +240,10 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         // 2. MOVE TILES
         for (tile in tiles) {
             if (tile.isHit) continue
-            tile.y += activeTileSpeed
+            tile.y -= activeTileSpeed
 
-            // Remove if off screen
-            if (tile.y > height) {
+            // Remove if off screen (above)
+            if (tile.y < -300f) {
                 tiles.remove(tile)
                 if (!tile.isHit) {
                     synchronized(lock) {
@@ -264,7 +288,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     }
 
     private fun spawnTile(lane: Int) {
-        val newTile = Tile(lane = lane, y = -300f)
+        val newTile = Tile(lane = lane, y = height.toFloat() + 300f)
         tiles.add(newTile)
     }
 
@@ -282,6 +306,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 GameState.MAIN_MENU -> drawMainMenu(canvas)
                 GameState.SONG_SELECT -> drawSongSelect(canvas)
                 GameState.SETTINGS -> drawSettings(canvas)
+                GameState.COUNTDOWN -> drawCountdown(canvas)
                 GameState.PLAYING -> drawPlayingScreen(canvas)
                 GameState.PAUSED -> drawPauseScreen(canvas)
                 GameState.GAME_OVER -> drawGameOverScreen(canvas)
@@ -571,11 +596,74 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawText(text, bounds.centerX(), bounds.centerY() + 12f, paint)
     }
 
+    private fun drawTile(canvas: Canvas, tile: Tile, laneWidth: Float) {
+        val tileX = tile.lane * laneWidth
+        val padding = 20f
+        val laneColor = getLaneColor(tile.lane)
+        val tileRect = RectF(
+            tileX + padding,
+            tile.y,
+            tileX + laneWidth - padding,
+            tile.y + 300f
+        )
+
+        // Glow layer
+        val glowRect = RectF(
+            tileRect.left - 8f,
+            tileRect.top - 8f,
+            tileRect.right + 8f,
+            tileRect.bottom + 8f
+        )
+        paint.color = laneColor
+        paint.alpha = 60
+        paint.style = Paint.Style.FILL
+        canvas.drawRoundRect(glowRect, 48f, 48f, paint)
+
+        // Main tile
+        paint.color = laneColor
+        paint.alpha = 255
+        canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+    }
+
+    private fun drawCountdown(canvas: Canvas) {
+        canvas.drawColor(Color.BLACK)
+
+        val elapsed = System.currentTimeMillis() - countdownStartTime
+
+        val text: String = when {
+            elapsed < 1000L -> "3"
+            elapsed < 2000L -> "2"
+            elapsed < 3000L -> "1"
+            else -> "GO!"
+        }
+
+        // Scale-pulse animation within each second
+        val phaseElapsed = elapsed % 1000L
+        val pulseScale = 1.0f + 0.3f * (1f - (phaseElapsed / 1000f).coerceIn(0f, 1f))
+
+        paint.isAntiAlias = true
+        paint.color = Color.WHITE
+        paint.textSize = 200f
+        paint.textAlign = Paint.Align.CENTER
+        paint.style = Paint.Style.FILL
+
+        val centerX = width / 2f
+        val centerY = height / 2f
+
+        canvas.save()
+        canvas.translate(centerX, centerY)
+        canvas.scale(pulseScale, pulseScale)
+        canvas.drawText(text, 0f, 70f, paint)
+        canvas.restore()
+
+        paint.textAlign = Paint.Align.LEFT
+    }
+
     private fun drawPlayingScreen(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
 
         val laneWidth = width / 3f
-        perfectLineY = height * 0.8f
+        perfectLineY = height * 0.2f
 
         // Draw Lanes
         paint.style = Paint.Style.FILL
@@ -616,22 +704,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         paint.alpha = 255
         canvas.drawLine(0f, perfectLineY, width.toFloat(), perfectLineY, paint)
 
-        // Draw Tiles (non-hit)
+        // Draw Tiles (non-hit) - rounded pill with glow
         paint.style = Paint.Style.FILL
-        paint.color = if (isMissed) Color.RED else Color.GREEN
-        paint.alpha = 255
 
         for (tile in tiles) {
             if (tile.isHit) continue
-            val tileX = tile.lane * laneWidth
-            val padding = 20f
-            canvas.drawRect(
-                tileX + padding,
-                tile.y,
-                tileX + laneWidth - padding,
-                tile.y + 300f,
-                paint
-            )
+            drawTile(canvas, tile, laneWidth)
         }
 
         // Draw hit-animating tiles (scale + fade)
@@ -646,19 +724,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             val padding = 20f
             val tileCenterX = tileX + laneWidth / 2f
             val tileCenterY = tile.y + 150f
+            val laneColor = getLaneColor(tile.lane)
 
             canvas.save()
             canvas.translate(tileCenterX, tileCenterY)
             canvas.scale(scale, scale)
-            paint.color = Color.GREEN
+            paint.color = laneColor
             paint.alpha = tileAlpha
             paint.style = Paint.Style.FILL
-            canvas.drawRect(
-                -laneWidth / 2f + padding,
-                -150f,
-                laneWidth / 2f - padding,
-                150f,
-                paint
+            canvas.drawRoundRect(
+                RectF(-laneWidth / 2f + padding, -150f, laneWidth / 2f - padding, 150f),
+                40f, 40f, paint
             )
             canvas.restore()
         }
@@ -757,7 +833,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawColor(Color.BLACK)
 
         val laneWidth = width / 3f
-        perfectLineY = height * 0.8f
+        perfectLineY = height * 0.2f
 
         // Draw Lanes
         paint.style = Paint.Style.FILL
@@ -771,18 +847,9 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         paint.strokeWidth = 10f
         canvas.drawLine(0f, perfectLineY, width.toFloat(), perfectLineY, paint)
 
-        // Draw Tiles (frozen)
-        paint.color = Color.GREEN
+        // Draw Tiles (frozen) - rounded pill with lane colors
         for (tile in tiles) {
-            val tileX = tile.lane * laneWidth
-            val padding = 20f
-            canvas.drawRect(
-                tileX + padding,
-                tile.y,
-                tileX + laneWidth - padding,
-                tile.y + 300f,
-                paint
-            )
+            drawTile(canvas, tile, laneWidth)
         }
 
         // Score
@@ -867,6 +934,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     GameState.MAIN_MENU -> handleMainMenuTouch(pX, pY)
                     GameState.SONG_SELECT -> handleSongSelectTouch(pX, pY)
                     GameState.SETTINGS -> handleSettingsDown(pX, pY)
+                    GameState.COUNTDOWN -> { /* ignore touches during countdown */ }
                     GameState.PLAYING -> handlePlayingTouch(pX, pY)
                     GameState.PAUSED -> handlePausedTouch(pX, pY)
                     GameState.GAME_OVER -> {
@@ -1184,9 +1252,9 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             beatsReady = true
             if (startAfterDetection) {
                 synchronized(lock) {
-                    changeState(GameState.PLAYING)
+                    countdownStartTime = System.currentTimeMillis()
+                    changeState(GameState.COUNTDOWN)
                 }
-                safeMediaStart()
             }
             songLaunchInProgress = false
         }.start()
