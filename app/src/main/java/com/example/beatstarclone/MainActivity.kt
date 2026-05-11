@@ -10,7 +10,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        gameView = GameView(this)
+        gameView = GameView(this, GameSettings.DEFAULT)
 
         setContentView(gameView)
     }
