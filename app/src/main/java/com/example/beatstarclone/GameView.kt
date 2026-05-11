@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaPlayer
+import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -49,7 +50,13 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
         mediaPlayer?.setOnCompletionListener {
             gameState = GameState.GAME_OVER
         }
-        generateAutoBeats(bpm = 105, durationSecs = 240)
+        try {
+            val detector = BeatDetector(appContext)
+            songNotes.addAll(detector.detectBeats(R.raw.beat))
+        } catch (e: Exception) {
+            Log.w("GameView", "Beat detection failed, using fallback", e)
+            generateAutoBeats(bpm = 105, durationSecs = 240)
+        }
     }
 
     override fun run() {
@@ -277,7 +284,13 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             gameState = GameState.GAME_OVER
         }
 
-        generateAutoBeats(bpm = 105, durationSecs = 240)
+        try {
+            val detector = BeatDetector(appContext)
+            songNotes.addAll(detector.detectBeats(R.raw.beat))
+        } catch (e: Exception) {
+            Log.w("GameView", "Beat detection failed, using fallback", e)
+            generateAutoBeats(bpm = 105, durationSecs = 240)
+        }
     }
 
     private fun control() {
