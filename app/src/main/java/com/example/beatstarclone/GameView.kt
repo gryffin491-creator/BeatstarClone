@@ -16,9 +16,25 @@ import kotlin.math.abs
 data class Tile(var lane: Int, var y: Float, var isHit: Boolean = false)
 data class Note(val timestamp: Long, val lane: Int)
 
-enum class GameState { START, PLAYING, GAME_OVER }
+data class HitFeedback(
+    val text: String,
+    val x: Float,
+    val y: Float,
+    val alpha: Float,
+    val createdAt: Long,
+    val color: Int
+)
 
-class GameView(context: Context) : SurfaceView(context), Runnable {
+class ScreenTransition(
+    val fromState: GameState,
+    val toState: GameState,
+    var progress: Float,
+    val startTime: Long
+)
+
+enum class GameState { MAIN_MENU, SONG_SELECT, SETTINGS, PLAYING, PAUSED, GAME_OVER }
+
+class GameView(context: Context, private val settings: GameSettings = GameSettings.DEFAULT) : SurfaceView(context), Runnable {
 
     // System Variables
     private var playing = false
@@ -26,9 +42,12 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     private val surfaceHolder: SurfaceHolder = holder
     private val paint = Paint()
 
+    // Thread safety lock
+    private val lock = Any()
+
     // Game State
     @Volatile
-    private var gameState = GameState.START
+    private var gameState = GameState.MAIN_MENU
     @Volatile
     private var consecutiveMisses = 0
     @Volatile
@@ -40,10 +59,16 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     private var nextNoteIndex = 0
 
     // Settings
-    private val tileSpeed = 15f
+    private val tileSpeed = settings.tileSpeed
     private var perfectLineY = 0f
     private var score = 0
     private var isMissed = false
+
+    // Hit Feedback
+    val hitFeedbacks = CopyOnWriteArrayList<HitFeedback>()
+
+    // Screen Transition
+    var currentTransition: ScreenTransition? = null
 
     // Audio
     private var mediaPlayer: MediaPlayer? = null
@@ -52,7 +77,9 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
     init {
         mediaPlayer = MediaPlayer.create(appContext, R.raw.beat)
         mediaPlayer?.setOnCompletionListener {
-            gameState = GameState.GAME_OVER
+            synchronized(lock) {
+                gameState = GameState.GAME_OVER
+            }
         }
         Thread {
             try {
@@ -107,12 +134,14 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
                 val currentTime = player.currentPosition
 
                 synchronized(songNotes) {
-                    if (nextNoteIndex < songNotes.size) {
-                        val nextNote = songNotes[nextNoteIndex]
+                    synchronized(lock) {
+                        if (nextNoteIndex < songNotes.size) {
+                            val nextNote = songNotes[nextNoteIndex]
 
-                        if (currentTime >= nextNote.timestamp - 2000) {
-                            spawnTile(nextNote.lane)
-                            nextNoteIndex++
+                            if (currentTime >= nextNote.timestamp - 2000) {
+                                spawnTile(nextNote.lane)
+                                nextNoteIndex++
+                            }
                         }
                     }
                 }
@@ -127,15 +156,17 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             if (tile.y > height) {
                 tiles.remove(tile)
                 if (!tile.isHit) {
-                    score -= 10
-                    isMissed = true
-                    consecutiveMisses++
+                    synchronized(lock) {
+                        score -= 10
+                        consecutiveMisses++
 
-                    if (consecutiveMisses >= 10) {
-                        gameState = GameState.GAME_OVER
-                        mediaPlayer?.pause()
-                        return
+                        if (consecutiveMisses >= 10) {
+                            gameState = GameState.GAME_OVER
+                            mediaPlayer?.pause()
+                            return
+                        }
                     }
+                    isMissed = true
                 }
             }
         }
@@ -151,8 +182,11 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             val canvas: Canvas = surfaceHolder.lockCanvas()
 
             when (gameState) {
-                GameState.START -> drawStartScreen(canvas)
+                GameState.MAIN_MENU -> drawStartScreen(canvas)
+                GameState.SONG_SELECT -> drawStartScreen(canvas)
+                GameState.SETTINGS -> drawStartScreen(canvas)
                 GameState.PLAYING -> drawPlayingScreen(canvas)
+                GameState.PAUSED -> drawPlayingScreen(canvas)
                 GameState.GAME_OVER -> drawGameOverScreen(canvas)
             }
 
@@ -264,15 +298,19 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
             val touchX = event.getX(pointerIndex)
 
             when (gameState) {
-                GameState.START -> {
+                GameState.MAIN_MENU -> {
                     if (beatsReady) {
-                        gameState = GameState.PLAYING
+                        synchronized(lock) {
+                            gameState = GameState.PLAYING
+                        }
                         mediaPlayer?.start()
                     }
                 }
                 GameState.GAME_OVER -> {
                     resetGame()
-                    gameState = GameState.START
+                    synchronized(lock) {
+                        gameState = GameState.MAIN_MENU
+                    }
                 }
                 GameState.PLAYING -> {
                     val laneWidth = width / 3f
@@ -283,20 +321,25 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
                             val tileCenter = tile.y + 150f
                             val distance = abs(tileCenter - perfectLineY)
 
-                            if (distance < 250) {
+                            if (distance < settings.hitWindowOK) {
                                 tile.isHit = true
-                                score += when {
-                                    distance < 80 -> 150
-                                    distance < 160 -> 100
-                                    else -> 50
+                                synchronized(lock) {
+                                    score += when {
+                                        distance < settings.hitWindowPerfect -> 150
+                                        distance < settings.hitWindowGood -> 100
+                                        else -> 50
+                                    }
+                                    consecutiveMisses = 0
                                 }
                                 tiles.remove(tile)
-                                consecutiveMisses = 0
                                 break
                             }
                         }
                     }
                 }
+                GameState.SONG_SELECT -> { /* placeholder */ }
+                GameState.SETTINGS -> { /* placeholder */ }
+                GameState.PAUSED -> { /* placeholder */ }
             }
         }
         return true
@@ -307,15 +350,21 @@ class GameView(context: Context) : SurfaceView(context), Runnable {
         synchronized(songNotes) {
             songNotes.clear()
         }
-        score = 0
-        nextNoteIndex = 0
-        consecutiveMisses = 0
+        synchronized(lock) {
+            score = 0
+            nextNoteIndex = 0
+            consecutiveMisses = 0
+        }
         isMissed = false
+        hitFeedbacks.clear()
+        currentTransition = null
 
         mediaPlayer?.release()
         mediaPlayer = MediaPlayer.create(appContext, R.raw.beat)
         mediaPlayer?.setOnCompletionListener {
-            gameState = GameState.GAME_OVER
+            synchronized(lock) {
+                gameState = GameState.GAME_OVER
+            }
         }
 
         beatsReady = false
