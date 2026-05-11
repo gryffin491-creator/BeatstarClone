@@ -113,9 +113,6 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     private var score = 0
     private var isMissed = false
 
-    // Combo counter
-    private var combo = 0
-
     // Difficulty
     private var difficultyManager: DifficultyManager? = null
     private var currentDifficulty: DifficultyLevel? = null
@@ -207,18 +204,20 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         val msPerBeat = 60000 / bpm
         val totalBeats = (durationSecs * 1000) / msPerBeat
 
+        val timestamps = ArrayList<Long>()
         var currentTimestamp = 2000L
 
         for (i in 0 until totalBeats) {
             val isRest = (0..10).random() == 0
 
             if (!isRest) {
-                val randomLane = (0..2).random()
-                songNotes.add(Note(currentTimestamp, randomLane))
+                timestamps.add(currentTimestamp)
             }
 
             currentTimestamp += msPerBeat
         }
+
+        songNotes.addAll(LaneAssigner.assignLanes(timestamps))
     }
 
     private fun update() {
@@ -272,13 +271,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
             // Remove if off screen (above)
             if (tile.y < -300f) {
+                // If this tile is currently being held, force-release it as a miss
+                if (tile.isHeld && !tile.isHit) {
+                    tile.isHeld = false
+                    tile.holdCompleted = false
+                }
                 tiles.remove(tile)
                 if (!tile.isHit) {
                     synchronized(lock) {
                         score -= 10
                         scoreMultiplier.onMiss()
                         healthBar.onMiss()
-                        combo = 0
 
                         if (healthBar.isDead()) {
                             gameState = GameState.GAME_OVER
@@ -996,7 +999,8 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         // Draw Combo counter with scale animation
         synchronized(lock) {
-            if (combo >= 5) {
+            val currentCombo = scoreMultiplier.getCombo()
+            if (currentCombo >= 5) {
                 val comboElapsed = currentTime - comboAnimStartTime
                 val comboScale = if (comboElapsed < 150) {
                     1.0f + 0.4f * (1f - comboElapsed / 150f)
@@ -1012,12 +1016,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 paint.textSize = 70f
                 paint.alpha = 100
                 paint.textAlign = Paint.Align.LEFT
-                canvas.drawText("x$combo", 0f, 0f, paint)
+                canvas.drawText("x$currentCombo", 0f, 0f, paint)
                 // White text on top
                 paint.color = Color.WHITE
                 paint.textSize = 60f
                 paint.alpha = 255
-                canvas.drawText("x$combo", 0f, 0f, paint)
+                canvas.drawText("x$currentCombo", 0f, 0f, paint)
                 canvas.restore()
             }
         }
@@ -1219,10 +1223,14 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     if (velocity > 800f && displacement > 80f) {
                         val swipeDir = if (abs(dx) > abs(dy)) {
                             if (dx < 0) SwipeDirection.LEFT else SwipeDirection.RIGHT
+                        } else if (dy < 0) {
+                            SwipeDirection.UP
                         } else {
-                            SwipeDirection.UP // dy < 0 means swipe up
+                            null // Downward swipe - not a valid swipe direction
                         }
-                        handleSwipe(downX, swipeDir)
+                        if (swipeDir != null) {
+                            handleSwipe(downX, swipeDir)
+                        }
                     }
 
                     // Clean up tracking maps
@@ -1392,13 +1400,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         }
                     }
 
-                    val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
-
+                    val multipliedGain: Int
                     synchronized(lock) {
                         scoreMultiplier.onHit()
                         healthBar.onHit()
+                        multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
                         score += multipliedGain
-                        combo = scoreMultiplier.getCombo()
                         comboAnimStartTime = System.currentTimeMillis()
 
                         val newMultiplier = scoreMultiplier.getMultiplier()
@@ -1407,7 +1414,8 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                             lastMultiplierLevel = newMultiplier
                         }
 
-                        if (combo == 10 || combo == 25 || combo == 50 || combo == 100) {
+                        val currentCombo = scoreMultiplier.getCombo()
+                        if (currentCombo == 10 || currentCombo == 25 || currentCombo == 50 || currentCombo == 100) {
                             borderFlashTime = System.currentTimeMillis()
                         }
                     }
@@ -1510,13 +1518,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                             }
                         }
 
-                        val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
-
+                        val multipliedGain: Int
                         synchronized(lock) {
                             scoreMultiplier.onHit()
                             healthBar.onHit()
+                            multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
                             score += multipliedGain
-                            combo = scoreMultiplier.getCombo()
                             comboAnimStartTime = System.currentTimeMillis()
 
                             val newMultiplier = scoreMultiplier.getMultiplier()
@@ -1542,7 +1549,6 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         synchronized(lock) {
                             scoreMultiplier.onMiss()
                             healthBar.onMiss()
-                            combo = 0
                         }
                         if (missFlashes.size < 10) {
                             missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
@@ -1621,12 +1627,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 tile.holdCompleted = holdRatio >= 0.25f
 
                 if (scoreGain > 0) {
-                    val multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
+                    val multipliedGain: Int
                     synchronized(lock) {
                         scoreMultiplier.onHit()
                         healthBar.onHit()
+                        multipliedGain = scoreGain * scoreMultiplier.getMultiplier()
                         score += multipliedGain
-                        combo = scoreMultiplier.getCombo()
                         comboAnimStartTime = System.currentTimeMillis()
 
                         val newMultiplier = scoreMultiplier.getMultiplier()
@@ -1652,7 +1658,6 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     synchronized(lock) {
                         scoreMultiplier.onMiss()
                         healthBar.onMiss()
-                        combo = 0
                     }
                     if (missFlashes.size < 10) {
                         missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
@@ -1692,7 +1697,6 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             songNotes.clear()
             score = 0
             nextNoteIndex = 0
-            combo = 0
             scoreMultiplier.reset()
             healthBar.reset()
             lastMultiplierLevel = 1
