@@ -194,7 +194,16 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     }
 
     private fun update() {
-        if (gameState == GameState.COUNTDOWN) return
+        if (gameState == GameState.COUNTDOWN) {
+            val elapsed = System.currentTimeMillis() - countdownStartTime
+            if (elapsed > 3700L) {
+                synchronized(lock) {
+                    changeState(GameState.PLAYING)
+                }
+                safeMediaStart()
+            }
+            return
+        }
         if (gameState != GameState.PLAYING) return
 
         // Initialize difficulty manager if needed
@@ -587,24 +596,45 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawText(text, bounds.centerX(), bounds.centerY() + 12f, paint)
     }
 
+    private fun drawTile(canvas: Canvas, tile: Tile, laneWidth: Float) {
+        val tileX = tile.lane * laneWidth
+        val padding = 20f
+        val laneColor = getLaneColor(tile.lane)
+        val tileRect = RectF(
+            tileX + padding,
+            tile.y,
+            tileX + laneWidth - padding,
+            tile.y + 300f
+        )
+
+        // Glow layer
+        val glowRect = RectF(
+            tileRect.left - 8f,
+            tileRect.top - 8f,
+            tileRect.right + 8f,
+            tileRect.bottom + 8f
+        )
+        paint.color = laneColor
+        paint.alpha = 60
+        paint.style = Paint.Style.FILL
+        canvas.drawRoundRect(glowRect, 48f, 48f, paint)
+
+        // Main tile
+        paint.color = laneColor
+        paint.alpha = 255
+        canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+    }
+
     private fun drawCountdown(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
 
         val elapsed = System.currentTimeMillis() - countdownStartTime
 
-        val text: String
-        when {
-            elapsed < 1000L -> text = "3"
-            elapsed < 2000L -> text = "2"
-            elapsed < 3000L -> text = "1"
-            elapsed < 3700L -> text = "GO!"
-            else -> {
-                synchronized(lock) {
-                    changeState(GameState.PLAYING)
-                }
-                safeMediaStart()
-                return
-            }
+        val text: String = when {
+            elapsed < 1000L -> "3"
+            elapsed < 2000L -> "2"
+            elapsed < 3000L -> "1"
+            else -> "GO!"
         }
 
         // Scale-pulse animation within each second
@@ -679,32 +709,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         for (tile in tiles) {
             if (tile.isHit) continue
-            val tileX = tile.lane * laneWidth
-            val padding = 20f
-            val laneColor = getLaneColor(tile.lane)
-            val tileRect = RectF(
-                tileX + padding,
-                tile.y,
-                tileX + laneWidth - padding,
-                tile.y + 300f
-            )
-
-            // Glow layer
-            val glowRect = RectF(
-                tileRect.left - 8f,
-                tileRect.top - 8f,
-                tileRect.right + 8f,
-                tileRect.bottom + 8f
-            )
-            paint.color = laneColor
-            paint.alpha = 60
-            paint.style = Paint.Style.FILL
-            canvas.drawRoundRect(glowRect, 48f, 48f, paint)
-
-            // Main tile
-            paint.color = laneColor
-            paint.alpha = 255
-            canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+            drawTile(canvas, tile, laneWidth)
         }
 
         // Draw hit-animating tiles (scale + fade)
@@ -844,32 +849,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
         // Draw Tiles (frozen) - rounded pill with lane colors
         for (tile in tiles) {
-            val tileX = tile.lane * laneWidth
-            val padding = 20f
-            val laneColor = getLaneColor(tile.lane)
-            val tileRect = RectF(
-                tileX + padding,
-                tile.y,
-                tileX + laneWidth - padding,
-                tile.y + 300f
-            )
-
-            // Glow layer
-            val glowRect = RectF(
-                tileRect.left - 8f,
-                tileRect.top - 8f,
-                tileRect.right + 8f,
-                tileRect.bottom + 8f
-            )
-            paint.color = laneColor
-            paint.alpha = 60
-            paint.style = Paint.Style.FILL
-            canvas.drawRoundRect(glowRect, 48f, 48f, paint)
-
-            // Main tile
-            paint.color = laneColor
-            paint.alpha = 255
-            canvas.drawRoundRect(tileRect, 40f, 40f, paint)
+            drawTile(canvas, tile, laneWidth)
         }
 
         // Score
