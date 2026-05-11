@@ -229,7 +229,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
 
                         if (consecutiveMisses >= 10) {
                             gameState = GameState.GAME_OVER
-                            mediaPlayer?.pause()
+                            safeMediaPause()
                             return
                         }
                     }
@@ -1003,7 +1003,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             synchronized(lock) {
                 changeState(GameState.PAUSED)
             }
-            mediaPlayer?.pause()
+            safeMediaPause()
             return
         }
 
@@ -1120,7 +1120,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 synchronized(lock) {
                     changeState(GameState.PLAYING)
                 }
-                mediaPlayer?.start()
+                safeMediaStart()
             }
             restartButtonBounds.contains(x, y) -> {
                 resetGame()
@@ -1186,7 +1186,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 synchronized(lock) {
                     changeState(GameState.PLAYING)
                 }
-                mediaPlayer?.start()
+                safeMediaStart()
             }
             songLaunchInProgress = false
         }.start()
@@ -1215,6 +1215,22 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         gameThread?.start()
     }
 
+    private fun safeMediaPause() {
+        try {
+            mediaPlayer?.pause()
+        } catch (e: IllegalStateException) {
+            Log.w("GameView", "MediaPlayer pause failed: invalid state", e)
+        }
+    }
+
+    private fun safeMediaStart() {
+        try {
+            mediaPlayer?.start()
+        } catch (e: IllegalStateException) {
+            Log.w("GameView", "MediaPlayer start failed: invalid state", e)
+        }
+    }
+
     fun pause() {
         playing = false
         try {
@@ -1222,6 +1238,6 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         } catch (e: InterruptedException) {
             e.printStackTrace()
         }
-        mediaPlayer?.pause()
+        safeMediaPause()
     }
 }

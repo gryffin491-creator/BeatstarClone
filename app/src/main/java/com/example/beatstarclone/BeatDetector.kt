@@ -6,8 +6,6 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import java.nio.ByteOrder
 
-data class DecodeResult(val samples: ShortArray, val sampleRate: Int)
-
 class BeatDetector(private val context: Context) {
 
     companion object {
@@ -21,12 +19,16 @@ class BeatDetector(private val context: Context) {
     }
 
     fun detectBeats(rawResId: Int): List<Note> {
-        val decodeResult = decodeAudioToSamples(rawResId)
-        val beatTimestamps = detectBeatTimestamps(decodeResult.samples, decodeResult.sampleRate)
+        val beatTimestamps = decodeAndDetect(rawResId)
         return assignLanes(beatTimestamps)
     }
 
-    private fun decodeAudioToSamples(rawResId: Int): DecodeResult {
+    /**
+     * Streaming beat detection: decodes audio and processes it in fixed-size chunks,
+     * never holding the entire PCM in memory. Peak memory usage is just a few KB
+     * (the window buffer + energy history) instead of 350MB+ for a full song.
+     */
+    private fun decodeAndDetect(rawResId: Int): List<Long> {
         val extractor = MediaExtractor()
         val afd = context.resources.openRawResourceFd(rawResId)
         extractor.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
@@ -70,7 +72,25 @@ class BeatDetector(private val context: Context) {
         codec.configure(audioFormat, null, null, 0)
         codec.start()
 
-        val pcmData = ArrayList<Short>(1024 * 1024)
+        // Low-pass filter coefficient
+        val alpha = (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ) /
+            (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ + sampleRate)
+
+        // Streaming state: window buffer for energy computation
+        val windowBuffer = DoubleArray(WINDOW_SIZE)
+        var windowPos = 0
+        var windowIndex = 0
+
+        // IIR filter state
+        var prevFiltered = 0.0
+
+        // Beat detection state
+        val beats = ArrayList<Long>()
+        val energyHistory = ArrayList<Double>(HISTORY_SIZE)
+        var lastBeatTimeMs = -MIN_BEAT_INTERVAL_MS * 2
+        var prevWindowEnergy = 0.0
+        var prevPrevWindowEnergy = 0.0
+
         val bufferInfo = MediaCodec.BufferInfo()
         var inputDone = false
         var outputDone = false
@@ -117,18 +137,69 @@ class BeatDetector(private val context: Context) {
                         val shortBuffer = outputBuffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
                         val shortCount = shortBuffer.remaining()
 
+                        // Process samples inline: apply low-pass filter and accumulate into window
                         if (channelCount == 2) {
-                            // Downmix stereo to mono by averaging L+R pairs
                             var i = 0
                             while (i + 1 < shortCount) {
                                 val left = shortBuffer.get().toInt()
                                 val right = shortBuffer.get().toInt()
-                                pcmData.add(((left + right) / 2).toShort())
+                                val monoSample = ((left + right) / 2).toDouble() / Short.MAX_VALUE
+
+                                // Apply single-pole IIR low-pass filter
+                                val filtered = alpha * monoSample + (1.0 - alpha) * prevFiltered
+                                prevFiltered = filtered
+
+                                // Accumulate into window buffer
+                                windowBuffer[windowPos] = filtered
+                                windowPos++
+
+                                // When window is full, compute energy and run beat detection
+                                if (windowPos >= WINDOW_SIZE) {
+                                    val energy = computeWindowEnergy(windowBuffer)
+                                    processWindow(
+                                        energy, windowIndex, sampleRate,
+                                        energyHistory, beats,
+                                        prevWindowEnergy, prevPrevWindowEnergy,
+                                        lastBeatTimeMs
+                                    )?.let { beatTime ->
+                                        lastBeatTimeMs = beatTime
+                                    }
+                                    prevPrevWindowEnergy = prevWindowEnergy
+                                    prevWindowEnergy = energy
+                                    windowIndex++
+                                    windowPos = 0
+                                }
+
                                 i += 2
                             }
                         } else {
                             for (i in 0 until shortCount) {
-                                pcmData.add(shortBuffer.get())
+                                val rawSample = shortBuffer.get().toDouble() / Short.MAX_VALUE
+
+                                // Apply single-pole IIR low-pass filter
+                                val filtered = alpha * rawSample + (1.0 - alpha) * prevFiltered
+                                prevFiltered = filtered
+
+                                // Accumulate into window buffer
+                                windowBuffer[windowPos] = filtered
+                                windowPos++
+
+                                // When window is full, compute energy and run beat detection
+                                if (windowPos >= WINDOW_SIZE) {
+                                    val energy = computeWindowEnergy(windowBuffer)
+                                    processWindow(
+                                        energy, windowIndex, sampleRate,
+                                        energyHistory, beats,
+                                        prevWindowEnergy, prevPrevWindowEnergy,
+                                        lastBeatTimeMs
+                                    )?.let { beatTime ->
+                                        lastBeatTimeMs = beatTime
+                                    }
+                                    prevPrevWindowEnergy = prevWindowEnergy
+                                    prevWindowEnergy = energy
+                                    windowIndex++
+                                    windowPos = 0
+                                }
                             }
                         }
                     }
@@ -142,73 +213,75 @@ class BeatDetector(private val context: Context) {
             extractor.release()
         }
 
-        return DecodeResult(pcmData.toShortArray(), sampleRate)
-    }
-
-    private fun detectBeatTimestamps(samples: ShortArray, sampleRate: Int): List<Long> {
-        // Apply single-pole IIR low-pass filter to isolate bass/kick frequencies
-        val alpha = (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ) /
-            (2.0 * Math.PI * LOW_PASS_CUTOFF_HZ + sampleRate)
-        val filtered = DoubleArray(samples.size)
-        filtered[0] = alpha * (samples[0].toDouble() / Short.MAX_VALUE)
-        for (i in 1 until samples.size) {
-            val sample = samples[i].toDouble() / Short.MAX_VALUE
-            filtered[i] = alpha * sample + (1.0 - alpha) * filtered[i - 1]
-        }
-
-        // Compute energy per window from filtered (bass) signal
-        val totalWindows = filtered.size / WINDOW_SIZE
-        val windowEnergies = DoubleArray(totalWindows)
-        for (windowIndex in 0 until totalWindows) {
-            val startSample = windowIndex * WINDOW_SIZE
-            var sumSquared = 0.0
-            for (i in startSample until startSample + WINDOW_SIZE) {
-                sumSquared += filtered[i] * filtered[i]
-            }
-            windowEnergies[windowIndex] = Math.sqrt(sumSquared / WINDOW_SIZE)
-        }
-
-        // Adaptive thresholding with peak-picking
-        val beats = ArrayList<Long>()
-        val energyHistory = ArrayList<Double>(HISTORY_SIZE)
-        var lastBeatTimeMs = -MIN_BEAT_INTERVAL_MS * 2
-
-        for (windowIndex in 0 until totalWindows) {
-            val energy = windowEnergies[windowIndex]
-
-            // Check if current window is a local peak (greater than neighbors)
-            val isLocalPeak = when {
-                windowIndex == 0 -> energy > windowEnergies.getOrElse(1) { 0.0 }
-                windowIndex == totalWindows - 1 -> energy > windowEnergies[windowIndex - 1]
-                else -> energy > windowEnergies[windowIndex - 1] &&
-                    energy > windowEnergies[windowIndex + 1]
-            }
-
-            // Compute rolling average for adaptive threshold
-            val averageEnergy = if (energyHistory.isNotEmpty()) {
-                energyHistory.sum() / energyHistory.size
-            } else {
-                energy
-            }
-
-            val timestampMs = (windowIndex.toLong() * WINDOW_SIZE * 1000L) / sampleRate
-            if (isLocalPeak &&
-                energy > averageEnergy * THRESHOLD_MULTIPLIER &&
-                timestampMs - lastBeatTimeMs >= MIN_BEAT_INTERVAL_MS
-            ) {
-                beats.add(timestampMs)
-                lastBeatTimeMs = timestampMs
-            }
-
-            // Update history
-            energyHistory.add(energy)
-            if (energyHistory.size > HISTORY_SIZE) {
-                energyHistory.removeAt(0)
-            }
-        }
-
         beats.sort()
         return beats
+    }
+
+    private fun computeWindowEnergy(windowBuffer: DoubleArray): Double {
+        var sumSquared = 0.0
+        for (sample in windowBuffer) {
+            sumSquared += sample * sample
+        }
+        return Math.sqrt(sumSquared / WINDOW_SIZE)
+    }
+
+    /**
+     * Process a single window's energy for beat detection.
+     * Returns the beat timestamp if a beat was detected, null otherwise.
+     */
+    private fun processWindow(
+        energy: Double,
+        windowIndex: Int,
+        sampleRate: Int,
+        energyHistory: ArrayList<Double>,
+        beats: ArrayList<Long>,
+        prevWindowEnergy: Double,
+        prevPrevWindowEnergy: Double,
+        lastBeatTimeMs: Long
+    ): Long? {
+        // Check if current window is a local peak (greater than previous window)
+        // For the streaming approach, we detect peaks by comparing to the previous window.
+        // A peak is when current energy > previous energy and previous energy >= the one before that
+        // (i.e., previous was rising and now we are at a peak or the previous was a peak).
+        // Simplified: current energy > previous energy means we are still rising, so the
+        // actual peak detection checks if previous was a peak: prev > prevPrev and prev > current.
+        // However, since we process one window at a time, we detect a beat at windowIndex-1
+        // when prevWindowEnergy > prevPrevWindowEnergy and prevWindowEnergy > energy.
+        val isLocalPeak = if (windowIndex >= 2) {
+            prevWindowEnergy > prevPrevWindowEnergy && prevWindowEnergy > energy
+        } else if (windowIndex == 1) {
+            prevWindowEnergy > energy
+        } else {
+            false
+        }
+
+        // Compute rolling average for adaptive threshold
+        val averageEnergy = if (energyHistory.isNotEmpty()) {
+            energyHistory.sum() / energyHistory.size
+        } else {
+            energy
+        }
+
+        // The peak is at windowIndex-1 (the previous window)
+        val peakWindowIndex = windowIndex - 1
+        val timestampMs = (peakWindowIndex.toLong() * WINDOW_SIZE * 1000L) / sampleRate
+
+        var result: Long? = null
+        if (isLocalPeak &&
+            prevWindowEnergy > averageEnergy * THRESHOLD_MULTIPLIER &&
+            timestampMs - lastBeatTimeMs >= MIN_BEAT_INTERVAL_MS
+        ) {
+            beats.add(timestampMs)
+            result = timestampMs
+        }
+
+        // Update history with current energy
+        energyHistory.add(energy)
+        if (energyHistory.size > HISTORY_SIZE) {
+            energyHistory.removeAt(0)
+        }
+
+        return result
     }
 
     private fun assignLanes(beatTimestamps: List<Long>): List<Note> {
