@@ -18,8 +18,25 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 // 1. DATA CLASSES
-data class Tile(var lane: Int, var y: Float, var isHit: Boolean = false, var hitTime: Long = 0L)
-data class Note(val timestamp: Long, val lane: Int)
+data class Tile(
+    var lane: Int,
+    var y: Float,
+    var isHit: Boolean = false,
+    var hitTime: Long = 0L,
+    var noteType: NoteType = NoteType.TAP,
+    var holdEndY: Float = 0f,
+    var swipeDirection: SwipeDirection? = null,
+    var isHeld: Boolean = false,
+    var holdCompleted: Boolean = false
+)
+
+data class Note(
+    val timestamp: Long,
+    val lane: Int,
+    val noteType: NoteType = NoteType.TAP,
+    val holdDurationMs: Long = 0L,
+    val swipeDirection: SwipeDirection? = null
+)
 
 data class HitFeedback(
     val text: String,

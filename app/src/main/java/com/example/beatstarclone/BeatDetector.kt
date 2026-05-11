@@ -284,14 +284,16 @@ class BeatDetector(private val context: Context) {
         return result
     }
 
-    private fun assignLanes(beatTimestamps: List<Long>): List<Note> {
+    internal fun assignLanes(beatTimestamps: List<Long>): List<Note> {
         if (beatTimestamps.isEmpty()) return emptyList()
 
         val notes = ArrayList<Note>(beatTimestamps.size)
         var lastLane = 1
         var consecutiveSameLane = 0
+        val random = kotlin.random.Random(beatTimestamps.hashCode().toLong())
 
-        for (i in beatTimestamps.indices) {
+        var i = 0
+        while (i < beatTimestamps.size) {
             val timestamp = beatTimestamps[i]
             val lane: Int
 
@@ -330,7 +332,35 @@ class BeatDetector(private val context: Context) {
             }
 
             lastLane = finalLane
-            notes.add(Note(timestamp, finalLane))
+
+            // Determine note type: ~20% HOLD, ~10% SWIPE, ~70% TAP
+            val roll = random.nextInt(100)
+            when {
+                roll < 20 -> {
+                    // Attempt HOLD note
+                    val holdDuration = random.nextLong(400, 801)
+                    val holdEnd = timestamp + holdDuration
+                    // Check if hold would overlap the next beat
+                    val nextTimestamp = if (i + 1 < beatTimestamps.size) beatTimestamps[i + 1] else Long.MAX_VALUE
+                    if (holdEnd < nextTimestamp) {
+                        notes.add(Note(timestamp, finalLane, NoteType.HOLD, holdDurationMs = holdDuration))
+                    } else {
+                        // Overlap detected, fall back to TAP
+                        notes.add(Note(timestamp, finalLane, NoteType.TAP))
+                    }
+                }
+                roll < 30 -> {
+                    // SWIPE note
+                    val direction = SwipeDirection.entries[random.nextInt(SwipeDirection.entries.size)]
+                    notes.add(Note(timestamp, finalLane, NoteType.SWIPE, swipeDirection = direction))
+                }
+                else -> {
+                    // TAP note
+                    notes.add(Note(timestamp, finalLane, NoteType.TAP))
+                }
+            }
+
+            i++
         }
 
         return notes
