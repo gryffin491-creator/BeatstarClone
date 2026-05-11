@@ -81,7 +81,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     private var currentDifficulty: DifficultyLevel? = null
 
     // Hit Feedback
-    val hitFeedbacks = CopyOnWriteArrayList<HitFeedback>()
+    private val hitFeedbacks = CopyOnWriteArrayList<HitFeedback>()
 
     // Lane Glow effects
     private val laneGlows = CopyOnWriteArrayList<LaneGlow>()
@@ -97,14 +97,16 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
     private var borderFlashTime = 0L
 
     // Screen Transition
-    var currentTransition: ScreenTransition? = null
+    private var currentTransition: ScreenTransition? = null
 
     // Song selection
     private var selectedSong: SongData = SongRepository.getSongs().first()
 
     // Audio
+    @Volatile
     private var mediaPlayer: MediaPlayer? = null
     private val appContext: Context = context.applicationContext
+    private var songLaunchInProgress = false
 
     // Button bounds for touch detection
     private val playButtonBounds = RectF()
@@ -137,12 +139,12 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             try {
                 val detector = BeatDetector(appContext)
                 val beats = detector.detectBeats(selectedSong.resId)
-                synchronized(songNotes) {
+                synchronized(lock) {
                     songNotes.addAll(beats)
                 }
             } catch (e: Exception) {
                 Log.w("GameView", "Beat detection failed, using fallback", e)
-                synchronized(songNotes) {
+                synchronized(lock) {
                     generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
                 }
             }
@@ -198,15 +200,13 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
             if (player.isPlaying) {
                 val currentTime = player.currentPosition
 
-                synchronized(songNotes) {
-                    synchronized(lock) {
-                        if (nextNoteIndex < songNotes.size) {
-                            val nextNote = songNotes[nextNoteIndex]
+                synchronized(lock) {
+                    if (nextNoteIndex < songNotes.size) {
+                        val nextNote = songNotes[nextNoteIndex]
 
-                            if (currentTime >= nextNote.timestamp - activeSpawnAhead) {
-                                spawnTile(nextNote.lane)
-                                nextNoteIndex++
-                            }
+                        if (currentTime >= nextNote.timestamp - activeSpawnAhead) {
+                            spawnTile(nextNote.lane)
+                            nextNoteIndex++
                         }
                     }
                 }
@@ -234,7 +234,9 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                         }
                     }
                     isMissed = true
-                    missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
+                    if (missFlashes.size < 10) {
+                        missFlashes.add(MissFlash(tile.lane, System.currentTimeMillis()))
+                    }
                 }
             }
         }
@@ -285,11 +287,17 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                 GameState.GAME_OVER -> drawGameOverScreen(canvas)
             }
 
-            // Apply transition overlay
+            // Apply transition overlay (fade from black)
             currentTransition?.let { transition ->
                 val elapsed = System.currentTimeMillis() - transition.startTime
                 val progress = (elapsed / 300f).coerceIn(0f, 1f)
                 transition.progress = progress
+                if (progress < 1.0f) {
+                    val overlayAlpha = (255 * (1f - progress)).toInt()
+                    paint.color = Color.argb(overlayAlpha, 0, 0, 0)
+                    paint.style = Paint.Style.FILL
+                    canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+                }
                 if (progress >= 1.0f) {
                     currentTransition = null
                 }
@@ -1053,28 +1061,34 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
                     val feedbackX = tile.lane * laneWidth + laneWidth / 2f
                     val feedbackY = perfectLineY - 50f
 
-                    // Floating hit text
-                    hitFeedbacks.add(HitFeedback(
-                        text = feedbackText,
-                        x = feedbackX,
-                        y = feedbackY,
-                        alpha = 255f,
-                        createdAt = System.currentTimeMillis(),
-                        color = feedbackColor
-                    ))
+                    // Floating hit text (capped at 50)
+                    if (hitFeedbacks.size < 50) {
+                        hitFeedbacks.add(HitFeedback(
+                            text = feedbackText,
+                            x = feedbackX,
+                            y = feedbackY,
+                            alpha = 255f,
+                            createdAt = System.currentTimeMillis(),
+                            color = feedbackColor
+                        ))
+                    }
 
                     // Score popup near score area
-                    hitFeedbacks.add(HitFeedback(
-                        text = "+$scoreGain",
-                        x = 200f,
-                        y = 130f,
-                        alpha = 255f,
-                        createdAt = System.currentTimeMillis(),
-                        color = Color.WHITE
-                    ))
+                    if (hitFeedbacks.size < 50) {
+                        hitFeedbacks.add(HitFeedback(
+                            text = "+$scoreGain",
+                            x = 200f,
+                            y = 130f,
+                            alpha = 255f,
+                            createdAt = System.currentTimeMillis(),
+                            color = Color.WHITE
+                        ))
+                    }
 
-                    // Lane glow
-                    laneGlows.add(LaneGlow(tile.lane, System.currentTimeMillis(), feedbackColor))
+                    // Lane glow (capped at 20)
+                    if (laneGlows.size < 20) {
+                        laneGlows.add(LaneGlow(tile.lane, System.currentTimeMillis(), feedbackColor))
+                    }
 
                     // Particle burst on Perfect hits
                     if (distance < effectivePerfect && particles.size < 100) {
@@ -1123,12 +1137,10 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
     }
 
-    private fun startGameWithSong() {
+    private fun prepareGame(startAfterDetection: Boolean) {
         tiles.clear()
-        synchronized(songNotes) {
-            songNotes.clear()
-        }
         synchronized(lock) {
+            songNotes.clear()
             score = 0
             nextNoteIndex = 0
             consecutiveMisses = 0
@@ -1155,74 +1167,38 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         }
 
         beatsReady = false
+        songLaunchInProgress = true
         Thread {
             try {
                 val detector = BeatDetector(appContext)
                 val beats = detector.detectBeats(selectedSong.resId)
-                synchronized(songNotes) {
+                synchronized(lock) {
                     songNotes.addAll(beats)
                 }
             } catch (e: Exception) {
                 Log.w("GameView", "Beat detection failed, using fallback", e)
-                synchronized(songNotes) {
+                synchronized(lock) {
                     generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
                 }
             }
             beatsReady = true
-            synchronized(lock) {
-                changeState(GameState.PLAYING)
+            if (startAfterDetection) {
+                synchronized(lock) {
+                    changeState(GameState.PLAYING)
+                }
+                mediaPlayer?.start()
             }
-            mediaPlayer?.start()
+            songLaunchInProgress = false
         }.start()
     }
 
+    private fun startGameWithSong() {
+        if (songLaunchInProgress) return
+        prepareGame(startAfterDetection = true)
+    }
+
     private fun resetGame() {
-        tiles.clear()
-        synchronized(songNotes) {
-            songNotes.clear()
-        }
-        synchronized(lock) {
-            score = 0
-            nextNoteIndex = 0
-            consecutiveMisses = 0
-            combo = 0
-        }
-        isMissed = false
-        hitFeedbacks.clear()
-        laneGlows.clear()
-        missFlashes.clear()
-        particles.clear()
-        comboAnimStartTime = 0L
-        borderFlashTime = 0L
-        currentTransition = null
-        difficultyManager = null
-        currentDifficulty = null
-
-        mediaPlayer?.release()
-        mediaPlayer = MediaPlayer.create(appContext, selectedSong.resId)
-        mediaPlayer?.setVolume(currentSettings.volume, currentSettings.volume)
-        mediaPlayer?.setOnCompletionListener {
-            synchronized(lock) {
-                gameState = GameState.GAME_OVER
-            }
-        }
-
-        beatsReady = false
-        Thread {
-            try {
-                val detector = BeatDetector(appContext)
-                val beats = detector.detectBeats(selectedSong.resId)
-                synchronized(songNotes) {
-                    songNotes.addAll(beats)
-                }
-            } catch (e: Exception) {
-                Log.w("GameView", "Beat detection failed, using fallback", e)
-                synchronized(songNotes) {
-                    generateAutoBeats(bpm = selectedSong.bpm, durationSecs = 240)
-                }
-            }
-            beatsReady = true
-        }.start()
+        prepareGame(startAfterDetection = false)
     }
 
     private fun control() {

@@ -15,26 +15,14 @@ class DifficultyManager(private val songDurationMs: Long) {
             0f
         }
 
-        val speedMultiplier = when {
-            progress >= 0.75f -> 1.6f
-            progress >= 0.50f -> 1.4f
-            progress >= 0.25f -> 1.2f
-            else -> 1.0f
-        }
+        // Linear interpolation: smooth from 1.0 at start to 1.6 at end
+        val speedMultiplier = 1.0f + 0.6f * progress
 
-        val spawnAheadMs = when {
-            progress >= 0.75f -> 1400L
-            progress >= 0.50f -> 1600L
-            progress >= 0.25f -> 1800L
-            else -> 2000L
-        }
+        // Linear interpolation: smooth from 2000 at start to 1400 at end
+        val spawnAheadMs = (2000L - (600L * progress).toLong())
 
-        val hitWindowMultiplier = when {
-            progress >= 0.75f -> 0.85f
-            progress >= 0.50f -> 0.90f
-            progress >= 0.25f -> 0.95f
-            else -> 1.0f
-        }
+        // Linear interpolation: smooth from 1.0 at start to 0.85 at end
+        val hitWindowMultiplier = 1.0f - 0.15f * progress
 
         return DifficultyLevel(
             tileSpeed = baseTileSpeed * speedMultiplier,
