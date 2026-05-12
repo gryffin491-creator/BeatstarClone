@@ -284,55 +284,7 @@ class BeatDetector(private val context: Context) {
         return result
     }
 
-    private fun assignLanes(beatTimestamps: List<Long>): List<Note> {
-        if (beatTimestamps.isEmpty()) return emptyList()
-
-        val notes = ArrayList<Note>(beatTimestamps.size)
-        var lastLane = 1
-        var consecutiveSameLane = 0
-
-        for (i in beatTimestamps.indices) {
-            val timestamp = beatTimestamps[i]
-            val lane: Int
-
-            if (i > 0 && timestamp - beatTimestamps[i - 1] <= CLOSE_BEAT_THRESHOLD_MS) {
-                // Close beats: create a sweep pattern using adjacent lanes
-                lane = when (lastLane) {
-                    0 -> 1
-                    1 -> if (i % 2 == 0) 0 else 2
-                    2 -> 1
-                    else -> 1
-                }
-            } else {
-                // Isolated beat: pick a lane different from the last, using beat index for variety
-                lane = when (i % 5) {
-                    0 -> 0
-                    1 -> 2
-                    2 -> 1
-                    3 -> 0
-                    4 -> 2
-                    else -> 1
-                }
-            }
-
-            // Enforce: never same lane more than 2 in a row
-            val finalLane = if (lane == lastLane && consecutiveSameLane >= 1) {
-                // Pick a different lane
-                (lane + 1 + (i % 2)) % NUM_LANES
-            } else {
-                lane
-            }
-
-            if (finalLane == lastLane) {
-                consecutiveSameLane++
-            } else {
-                consecutiveSameLane = 0
-            }
-
-            lastLane = finalLane
-            notes.add(Note(timestamp, finalLane))
-        }
-
-        return notes
+    internal fun assignLanes(beatTimestamps: List<Long>): List<Note> {
+        return LaneAssigner.assignLanes(beatTimestamps)
     }
 }
