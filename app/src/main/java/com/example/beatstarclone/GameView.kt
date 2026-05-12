@@ -267,10 +267,10 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         // 2. MOVE TILES
         for (tile in tiles) {
             if (tile.isHit) continue
-            tile.y -= activeTileSpeed
+            tile.y += activeTileSpeed
 
-            // Remove if off screen (above)
-            if (tile.y < -300f) {
+            // Remove if off screen (below)
+            if (tile.y > height + 300f) {
                 // If this tile is currently being held, force-release it as a miss
                 if (tile.isHeld && !tile.isHit) {
                     tile.isHeld = false
@@ -323,7 +323,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         val activeTileSpeed = currentDifficulty?.tileSpeed ?: currentSettings.tileSpeed
         val newTile = Tile(
             lane = note.lane,
-            y = height.toFloat() + 300f,
+            y = -300f,
             noteType = note.noteType,
             swipeDirection = note.swipeDirection
         )
@@ -882,7 +882,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawColor(Color.BLACK)
 
         val laneWidth = width / 3f
-        perfectLineY = height * 0.2f
+        perfectLineY = height * 0.8f
 
         // Draw Lanes
         paint.style = Paint.Style.FILL
@@ -1063,7 +1063,7 @@ class GameView(context: Context, private val settings: GameSettings = GameSettin
         canvas.drawColor(Color.BLACK)
 
         val laneWidth = width / 3f
-        perfectLineY = height * 0.2f
+        perfectLineY = height * 0.8f
 
         // Draw Lanes
         paint.style = Paint.Style.FILL
